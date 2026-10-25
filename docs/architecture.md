@@ -1,45 +1,117 @@
-# ReuseLoop - Architecture Draft
 
-## 1. Logical components
+# ReuseLoop Architecture
 
-1. **Frontend:** React + TypeScript + Vite; item lookup, QR, borrow/return screens, current status, history.
-2. **Wallet integration:** CCC/JoyID for connection and transaction signing, subject to feasibility checks.
-3. **Application services:** item queries, transaction building/submission, status mapping, and error handling.
-4. **CKB:** cells and transactions represent lifecycle state; scripts validate the rules implemented by the chosen design.
-5. **Optional query/cache layer:** considered only if direct RPC queries are insufficient for item discovery or history.
+## 1. Overview
 
-## 2. Data separation
+ReuseLoop is a reusable packaging lifecycle application built on CKB.
 
-### Candidate on-chain data
-- Stable item identifier or identifier commitment.
-- Lifecycle state.
-- Issuing/receiving point identifiers as needed for validation.
-- Borrower reference only if privacy implications are acceptable.
-- Transaction-level transition data needed by the validation design.
+The MVP records the lifecycle of an item from availability, through
+borrowing and return confirmation, to availability for reuse.
 
-### Candidate off-chain data
-- Display names, images, item descriptions, and UI preferences.
-- QR rendering and convenience metadata.
-- Any personal data not required for on-chain validation.
+## 2. Components
 
-The final schema must be decided after the technical spike. Do not put personal information on-chain by default.
+### Frontend
+- React
+- TypeScript
+- Vite
+- CCC SDK for CKB interaction
+- Displays item state and transaction history
+- Initiates lifecycle operations through the administrator wallet
 
-## 3. Transaction flow (conceptual)
+### Administrator Wallet
+- One demo wallet authorizes and signs lifecycle transactions.
+- The wallet is an MVP simplification, not a multi-party authorization model.
+- Private keys and recovery phrases must never be stored in frontend source code.
 
-1. UI requests a state-changing action.
-2. Service loads/validates current item state and builds a transaction.
-3. Wallet signs the transaction where applicable.
-4. Transaction is submitted to CKB.
-5. App tracks submission and confirmation separately.
-6. App refreshes current state and history after confirmation.
+### CKB
+- Stores the current state in a ReuseLoop state Cell.
+- Records lifecycle changes as transactions.
+- Uses Script validation to enforce the state transition rules.
 
-## 4. Authorization questions
+### Optional Off-chain Data
+- Item display names, images, and supplementary metadata may be stored off-chain.
+- Off-chain data must not replace on-chain validation of critical state transitions.
+- Transaction history may be indexed for convenient frontend queries.
 
-- How are operator, issuing point, and receiving point identities represented?
-- Which party is allowed to update the state?
-- Can a receiving point confirm a return if it is not the original issuing point?
-- What Script design can enforce these rules on-chain?
+## 3. State Cell Model
 
-## 5. Design caveat
+Each item has one current ReuseLoop state Cell.
 
-This document is a draft. CKB's cell model does not automatically implement the application state machine. The chosen lock/type scripts and transaction structure must enforce the required invariants.
+The proposed logical fields are:
+
+- schema_version
+- item_id
+- status
+- current_holder, when required by the MVP
+- last_location, if included in the chosen encoding
+
+The final binary encoding and field sizes must be specified before
+implementing the on-chain validator.
+
+### Lock Script
+
+Controls who can consume the Cell according to the chosen authorization
+mechanism. The exact Lock Script and administrator signing flow must
+be selected during implementation.
+
+### Type Script
+
+Validates the ReuseLoop state Cell and permitted lifecycle transitions.
+The implementation must check the relationship between input and output
+Cells, including item identity and state transition.
+
+### Data
+
+Contains the encoded ReuseLoop item state. The encoding must be
+deterministic and validated by the Type Script.
+
+## 4. Transaction Flow
+
+### Borrow
+AVAILABLE Cell -> BORROWED Cell
+
+### Confirm Return
+BORROWED Cell -> RETURNED Cell
+
+### Make Available
+RETURNED Cell -> AVAILABLE Cell
+
+Each transition consumes the previous state Cell and creates its successor.
+The previous Cell cannot be consumed again after it has been spent in a
+confirmed transaction.
+
+## 5. Validation Requirements
+
+The implementation must define checks for:
+- Correct input state.
+- Correct output state.
+- Unchanged item identifier.
+- Valid administrator authorization.
+- Valid state data encoding.
+- Correct handling of transactions that attempt invalid transitions.
+
+The exact mechanism for validating administrator authorization must be
+confirmed in the Script design. A wallet signing a transaction alone
+does not automatically prove that a custom Type Script has validated
+the administrator's identity.
+
+## 6. MVP Scope
+
+Included:
+- Query item state.
+- Record borrowing.
+- Confirm return.
+- Mark returned items available.
+- Query transaction history.
+- Test valid and invalid transitions.
+
+Not required for MVP:
+- Multi-store independent authorization.
+- DOB/Spore integration.
+- Fiber payment integration.
+- Production deployment.
+
+## 7. Physical-World Limitation
+
+The blockchain records authorized statements about item handoff and return.
+It cannot independently verify that the physical package changed hands.
