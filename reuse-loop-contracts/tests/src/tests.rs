@@ -1,11 +1,14 @@
 use ckb_testtool::{
     builtin::ALWAYS_SUCCESS,
+    ckb_chain_spec::SystemCell,
+    ckb_crypto::secp::Privkey,
     ckb_error::Error,
-    ckb_hash::new_blake2b,
+    ckb_hash::{blake2b_256, new_blake2b},
     ckb_types::{
+        H256,
         bytes::Bytes,
-        core::{DepType, ScriptHashType, TransactionBuilder},
-        packed::*,
+        core::{DepType, ScriptHashType, TransactionBuilder, TransactionView},
+        packed::{self, *},
         prelude::*,
     },
     context::{Context, random_type_id_script},
@@ -3096,7 +3099,7 @@ fn state_rejects_remaining_invalid_lifecycle_transitions_and_cardinality() {
         );
     }
 
-    // 2. Missing State GroupInput (0 GroupInput -> 1 GroupOutput) -> ERROR_MISSING_CELL (4)
+    // 2. Unlinked State creation (0 GroupInput -> 1 GroupOutput without Registry 1->1 update) -> ERROR_UNTRUSTED_REGISTRY (10)
     let plain_in = f.context.create_cell(
         CellOutput::new_builder()
             .capacity(CAPACITY)
@@ -3119,7 +3122,7 @@ fn state_rejects_remaining_invalid_lifecycle_transitions_and_cardinality() {
     let tx_missing_in = f.context.complete_tx(tx_missing_in);
     assert_script_error(
         f.context.verify_tx(&tx_missing_in, MAX_CYCLES),
-        ERROR_MISSING_CELL,
+        ERROR_UNTRUSTED_REGISTRY,
     );
 
     // 3. State burn / missing State GroupOutput (1 GroupInput -> 0 GroupOutput) -> ERROR_MISSING_CELL (4)
@@ -3306,5 +3309,1776 @@ fn state_rejects_capacity_regression_or_insufficient_occupied_capacity() {
     assert_script_error(
         f.context.verify_tx(&tx_underfunded, MAX_CYCLES),
         ERROR_CAPACITY,
+    );
+}
+
+// ============================================================================
+// Week 10 CP 10.4: Atomic Registry + State Registration Infrastructure & Tests
+// ============================================================================
+
+fn blake160(data: &[u8]) -> [u8; 20] {
+    let mut buf = [0u8; 20];
+    let hash = blake2b_256(data);
+    buf.copy_from_slice(&hash[..20]);
+    buf
+}
+
+fn load_bundled_system_cell(bundled_path: &str) -> Bytes {
+    let spec_json = format!(
+        r#"{{"create_type_id":false,"capacity":null,"file":{{"bundled":"{bundled_path}"}}}}"#
+    );
+    let cell: SystemCell =
+        serde_json::from_str(&spec_json).expect("deserialize bundled system cell");
+    Bytes::from(
+        cell.file
+            .get()
+            .expect("load bundled system cell bytes")
+            .into_owned(),
+    )
+}
+
+fn sign_tx(tx: TransactionView, key: &Privkey) -> TransactionView {
+    const SIGNATURE_SIZE: usize = 65;
+
+    let witnesses_len = tx.witnesses().len();
+    let tx_hash = tx.hash();
+    let mut signed_witnesses: Vec<packed::Bytes> = Vec::new();
+    let mut blake2b = new_blake2b();
+    let mut message = [0u8; 32];
+    blake2b.update(&tx_hash.raw_data());
+
+    let witness = WitnessArgs::default();
+    let zero_lock: Bytes = Bytes::from(vec![0u8; SIGNATURE_SIZE]);
+    let witness_for_digest = witness
+        .clone()
+        .as_builder()
+        .lock(Some(zero_lock).pack())
+        .build();
+    let witness_len = witness_for_digest.as_bytes().len() as u64;
+    blake2b.update(&witness_len.to_le_bytes());
+    blake2b.update(&witness_for_digest.as_bytes());
+
+    for n in 1..witnesses_len {
+        let w = tx.witnesses().get(n).unwrap();
+        let w_len = w.raw_data().len() as u64;
+        blake2b.update(&w_len.to_le_bytes());
+        blake2b.update(&w.raw_data());
+    }
+    blake2b.finalize(&mut message);
+    let message = H256::from(message);
+    let sig = key.sign_recoverable(&message).expect("sign recoverable");
+    signed_witnesses.push(
+        witness
+            .as_builder()
+            .lock(Some(Bytes::from(sig.serialize())).pack())
+            .build()
+            .as_bytes()
+            .pack(),
+    );
+    for i in 1..witnesses_len {
+        signed_witnesses.push(tx.witnesses().get(i).unwrap());
+    }
+    tx.as_advanced_builder()
+        .set_witnesses(signed_witnesses)
+        .build()
+}
+
+fn assert_lock_script_error(result: Result<u64, Error>) {
+    let err = result.expect_err("expected lock script verification to fail");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("Inputs[0].Lock") && msg.contains("ValidationFailure"),
+        "expected Lock Script ValidationFailure on Inputs[0].Lock, but got: {msg}"
+    );
+}
+
+struct AtomicTestFixture {
+    context: Context,
+    registry_out_point: OutPoint,
+    state_out_point: OutPoint,
+    state_code_hash: [u8; 32],
+    state_hash_type: u8,
+    secp256k1_data_dep: CellDep,
+    admin_privkey: Privkey,
+    admin_lock_script: Script,
+    admin_lock_hash: [u8; 32],
+    other_privkey: Privkey,
+    other_lock_script: Script,
+}
+
+impl AtomicTestFixture {
+    fn new() -> Self {
+        let mut context = Context::default();
+
+        // Deploy both real RISC-V contract binaries
+        let registry_out_point = context.deploy_cell_by_name("registry");
+        let state_out_point = context.deploy_cell_by_name("state");
+
+        // Extract canonical State Type Script identity
+        let state_ref_script = context
+            .build_script(&state_out_point, Bytes::new())
+            .expect("build state reference script");
+        let state_code_hash = byte32_to_array(&state_ref_script.code_hash());
+        let state_hash_type = state_ref_script.hash_type().as_slice()[0];
+
+        // Deploy real CKB secp256k1_blake160_sighash_all Lock Script and secp256k1_data cell
+        let secp256k1_data_bin = load_bundled_system_cell("specs/cells/secp256k1_data");
+        let secp256k1_sighash_bin =
+            load_bundled_system_cell("specs/cells/secp256k1_blake160_sighash_all");
+        let secp256k1_data_out_point = context.deploy_cell(secp256k1_data_bin);
+        let secp256k1_sighash_out_point = context.deploy_cell(secp256k1_sighash_bin);
+        let secp256k1_data_dep = CellDep::new_builder()
+            .out_point(secp256k1_data_out_point)
+            .dep_type(DepType::Code)
+            .build();
+
+        // Generate deterministic secp256k1 keypairs for Admin and non-Admin
+        let admin_privkey = Privkey::from_slice(&[0x11u8; 32]);
+        let admin_pubkey = admin_privkey.pubkey().expect("admin pubkey");
+        let admin_pubkey_hash = blake160(&admin_pubkey.serialize());
+        let admin_lock_script = context
+            .build_script(
+                &secp256k1_sighash_out_point,
+                Bytes::from(admin_pubkey_hash.to_vec()),
+            )
+            .expect("build secp256k1 admin lock script");
+        let admin_lock_hash = byte32_to_array(&admin_lock_script.calc_script_hash());
+
+        let other_privkey = Privkey::from_slice(&[0x22u8; 32]);
+        let other_pubkey = other_privkey.pubkey().expect("other pubkey");
+        let other_pubkey_hash = blake160(&other_pubkey.serialize());
+        let other_lock_script = context
+            .build_script(
+                &secp256k1_sighash_out_point,
+                Bytes::from(other_pubkey_hash.to_vec()),
+            )
+            .expect("build secp256k1 other lock script");
+
+        Self {
+            context,
+            registry_out_point,
+            state_out_point,
+            state_code_hash,
+            state_hash_type,
+            secp256k1_data_dep,
+            admin_privkey,
+            admin_lock_script,
+            admin_lock_hash,
+            other_privkey,
+            other_lock_script,
+        }
+    }
+
+    fn build_registry_script(&mut self, args: Bytes) -> Script {
+        self.context
+            .build_script(&self.registry_out_point, args)
+            .expect("build real registry type script")
+    }
+
+    fn build_canonical_registry_script(&mut self, registry_id: &[u8; 32]) -> (Script, [u8; 32]) {
+        let reg_args = registry_args(
+            0x01,
+            registry_id,
+            &self.admin_lock_hash,
+            &self.state_code_hash,
+            self.state_hash_type,
+        );
+        assert_eq!(reg_args.len(), 98);
+        let reg_script = self.build_registry_script(reg_args);
+        let reg_type_hash = byte32_to_array(&reg_script.calc_script_hash());
+        (reg_script, reg_type_hash)
+    }
+
+    fn build_state_script(&mut self, args: Bytes) -> Script {
+        self.context
+            .build_script(&self.state_out_point, args)
+            .expect("build real state type script")
+    }
+
+    fn build_canonical_state_script(
+        &mut self,
+        item_id: &[u8; 32],
+        trusted_registry_type_hash: &[u8; 32],
+    ) -> Script {
+        let st_args = state_spec_args(
+            0x01,
+            item_id,
+            trusted_registry_type_hash,
+            &self.admin_lock_hash,
+        );
+        assert_eq!(st_args.len(), 97);
+        self.build_state_script(st_args)
+    }
+
+    fn complete_without_signing(&mut self, tx: TransactionView) -> TransactionView {
+        let tx_with_secp_dep = tx
+            .as_advanced_builder()
+            .cell_dep(self.secp256k1_data_dep.clone())
+            .build();
+        self.context.complete_tx(tx_with_secp_dep)
+    }
+
+    fn complete_and_sign(&mut self, tx: TransactionView, key: &Privkey) -> TransactionView {
+        let completed = self.complete_without_signing(tx);
+        sign_tx(completed, key)
+    }
+
+    fn build_valid_atomic_registration_tx(
+        &mut self,
+        registry_id: &[u8; 32],
+        existing_items: &[[u8; 32]],
+        new_item_id: &[u8; 32],
+    ) -> (TransactionView, OutPoint) {
+        let (reg_type_script, reg_type_hash) = self.build_canonical_registry_script(registry_id);
+        let state_type_script = self.build_canonical_state_script(new_item_id, &reg_type_hash);
+
+        let reg_in_out_point = self.context.create_cell(
+            CellOutput::new_builder()
+                .capacity(CAPACITY * 10)
+                .lock(self.admin_lock_script.clone())
+                .type_(Some(reg_type_script.clone()).pack())
+                .build(),
+            registry_data(0x01, registry_id, existing_items),
+        );
+
+        let mut updated_items = existing_items.to_vec();
+        updated_items.push(*new_item_id);
+
+        let reg_input = CellInput::new_builder()
+            .previous_output(reg_in_out_point.clone())
+            .build();
+        let reg_output = CellOutput::new_builder()
+            .capacity(CAPACITY * 10)
+            .lock(self.admin_lock_script.clone())
+            .type_(Some(reg_type_script).pack())
+            .build();
+        let state_output = CellOutput::new_builder()
+            .capacity(CAPACITY)
+            .lock(self.admin_lock_script.clone())
+            .type_(Some(state_type_script).pack())
+            .build();
+
+        let tx = TransactionBuilder::default()
+            .input(reg_input)
+            .output(reg_output)
+            .output_data(registry_data(0x01, registry_id, &updated_items))
+            .output(state_output)
+            .output_data(state_data(new_item_id, AVAILABLE))
+            .build();
+
+        (tx, reg_in_out_point)
+    }
+}
+
+// ----------------------------------------------------------------------------
+// 1. Positive Atomic Registration Tests (Both Real Binaries + Real Admin Sig)
+// ----------------------------------------------------------------------------
+
+#[test]
+fn atomic_registration_allows_first_item_from_empty_registry() {
+    let mut f = AtomicTestFixture::new();
+    let registry_id = [0x44u8; 32];
+    let item_1 = [0x01u8; 32];
+
+    let (reg_type_script, reg_type_hash) = f.build_canonical_registry_script(&registry_id);
+    let expected_state_script = f.build_canonical_state_script(&item_1, &reg_type_hash);
+
+    let (tx, reg_in_out_point) = f.build_valid_atomic_registration_tx(&registry_id, &[], &item_1);
+    let admin_privkey = f.admin_privkey.clone();
+    let signed_tx = f.complete_and_sign(tx, &admin_privkey);
+
+    // Ensure the Registry Cell is consumed as an Input and NOT treated as a CellDep
+    for dep in signed_tx.cell_deps() {
+        assert_ne!(
+            dep.out_point(),
+            reg_in_out_point,
+            "Registry Cell must not be a CellDep during atomic registration"
+        );
+    }
+
+    // Verify Registry output data (1 item appended)
+    let reg_out_data: Bytes = signed_tx.outputs_data().get(0).unwrap().unpack();
+    assert_eq!(reg_out_data.len(), 37 + 32);
+    assert_eq!(reg_out_data[0], 0x01);
+    assert_eq!(&reg_out_data[1..33], &registry_id);
+    assert_eq!(
+        u32::from_le_bytes(reg_out_data[33..37].try_into().unwrap()),
+        1
+    );
+    assert_eq!(&reg_out_data[37..69], &item_1);
+
+    // Verify State output Args, Data, AVAILABLE status, Lock, and Type Script
+    let state_out = signed_tx.outputs().get(1).unwrap();
+    assert_eq!(state_out.lock().as_slice(), f.admin_lock_script.as_slice());
+    let actual_state_script = state_out.type_().to_opt().expect("state type script");
+    assert_eq!(
+        actual_state_script.as_slice(),
+        expected_state_script.as_slice()
+    );
+    let actual_state_args: Bytes = actual_state_script.args().unpack();
+    assert_eq!(actual_state_args.len(), 97);
+    assert_eq!(actual_state_args[0], 0x01);
+    assert_eq!(&actual_state_args[1..33], &item_1);
+    assert_eq!(&actual_state_args[33..65], &reg_type_hash);
+    assert_eq!(&actual_state_args[65..97], &f.admin_lock_hash);
+
+    let state_out_data: Bytes = signed_tx.outputs_data().get(1).unwrap().unpack();
+    assert_eq!(state_out_data.len(), 34);
+    assert_eq!(state_out_data[0], 0x01);
+    assert_eq!(&state_out_data[1..33], &item_1);
+    assert_eq!(state_out_data[33], AVAILABLE);
+
+    let reg_out = signed_tx.outputs().get(0).unwrap();
+    assert_eq!(
+        reg_out.type_().to_opt().unwrap().as_slice(),
+        reg_type_script.as_slice()
+    );
+
+    // Execute real secp256k1_blake160_sighash_all Lock Script + real Registry + real State scripts
+    assert!(f.context.verify_tx(&signed_tx, MAX_CYCLES).is_ok());
+}
+
+#[test]
+fn atomic_registration_allows_subsequent_item_with_existing_items() {
+    let mut f = AtomicTestFixture::new();
+    let registry_id = [0x44u8; 32];
+    let item_1 = [0x01u8; 32];
+    let item_2 = [0x02u8; 32];
+    let item_3 = [0x03u8; 32];
+
+    let (_, reg_type_hash) = f.build_canonical_registry_script(&registry_id);
+    let expected_state_script = f.build_canonical_state_script(&item_3, &reg_type_hash);
+
+    let (tx, reg_in_out_point) =
+        f.build_valid_atomic_registration_tx(&registry_id, &[item_1, item_2], &item_3);
+    let admin_privkey = f.admin_privkey.clone();
+    let signed_tx = f.complete_and_sign(tx, &admin_privkey);
+
+    for dep in signed_tx.cell_deps() {
+        assert_ne!(dep.out_point(), reg_in_out_point);
+    }
+
+    // Verify Registry output preserves [item_1, item_2] and appends item_3
+    let reg_out_data: Bytes = signed_tx.outputs_data().get(0).unwrap().unpack();
+    assert_eq!(reg_out_data.len(), 37 + 32 * 3);
+    assert_eq!(
+        u32::from_le_bytes(reg_out_data[33..37].try_into().unwrap()),
+        3
+    );
+    assert_eq!(&reg_out_data[37..69], &item_1);
+    assert_eq!(&reg_out_data[69..101], &item_2);
+    assert_eq!(&reg_out_data[101..133], &item_3);
+
+    // Verify State output for item_3
+    let state_out = signed_tx.outputs().get(1).unwrap();
+    assert_eq!(
+        state_out.type_().to_opt().unwrap().as_slice(),
+        expected_state_script.as_slice()
+    );
+    let state_out_data: Bytes = signed_tx.outputs_data().get(1).unwrap().unpack();
+    assert_eq!(state_out_data, state_data(&item_3, AVAILABLE));
+
+    assert!(f.context.verify_tx(&signed_tx, MAX_CYCLES).is_ok());
+}
+
+#[test]
+fn atomic_e2e_genesis_registration_and_lifecycle_with_real_scripts_and_admin_sig() {
+    let mut f = AtomicTestFixture::new();
+    let admin_privkey = f.admin_privkey.clone();
+    let item_1 = [0xA1u8; 32];
+
+    // Step 1: Registry Genesis (0 -> 1) with CKB Type ID and real Admin signature
+    let seed_out_point = f.context.create_cell(
+        CellOutput::new_builder()
+            .capacity(CAPACITY * 10)
+            .lock(f.admin_lock_script.clone())
+            .build(),
+        Bytes::new(),
+    );
+    let genesis_input = CellInput::new_builder()
+        .previous_output(seed_out_point)
+        .since(0u64)
+        .build();
+    let registry_id = derive_registry_id(&genesis_input, 0);
+    let (reg_type_script, reg_type_hash) = f.build_canonical_registry_script(&registry_id);
+
+    let genesis_reg_output = CellOutput::new_builder()
+        .capacity(CAPACITY * 10)
+        .lock(f.admin_lock_script.clone())
+        .type_(Some(reg_type_script.clone()).pack())
+        .build();
+    let genesis_reg_data = registry_data(0x01, &registry_id, &[]);
+
+    let genesis_tx = TransactionBuilder::default()
+        .input(genesis_input)
+        .output(genesis_reg_output.clone())
+        .output_data(genesis_reg_data.clone())
+        .build();
+    let signed_genesis_tx = f.complete_and_sign(genesis_tx, &admin_privkey);
+    assert!(f.context.verify_tx(&signed_genesis_tx, MAX_CYCLES).is_ok());
+
+    // Step 2: Atomic Registration (Registry 1 -> 1, State 0 -> 1)
+    let reg_cell_0 = f.context.create_cell(genesis_reg_output, genesis_reg_data);
+    let state_type_script = f.build_canonical_state_script(&item_1, &reg_type_hash);
+
+    let reg_output_1 = CellOutput::new_builder()
+        .capacity(CAPACITY * 10)
+        .lock(f.admin_lock_script.clone())
+        .type_(Some(reg_type_script).pack())
+        .build();
+    let reg_data_1 = registry_data(0x01, &registry_id, &[item_1]);
+
+    let state_output_0 = CellOutput::new_builder()
+        .capacity(CAPACITY)
+        .lock(f.admin_lock_script.clone())
+        .type_(Some(state_type_script.clone()).pack())
+        .build();
+    let state_data_0 = state_data(&item_1, AVAILABLE);
+
+    let reg_tx = TransactionBuilder::default()
+        .input(CellInput::new_builder().previous_output(reg_cell_0).build())
+        .output(reg_output_1.clone())
+        .output_data(reg_data_1.clone())
+        .output(state_output_0.clone())
+        .output_data(state_data_0.clone())
+        .build();
+    let signed_reg_tx = f.complete_and_sign(reg_tx, &admin_privkey);
+    assert!(f.context.verify_tx(&signed_reg_tx, MAX_CYCLES).is_ok());
+
+    // Step 3: Lifecycle Transition (AVAILABLE -> BORROWED) with Registry CellDep
+    let reg_cell_1 = f.context.create_cell(reg_output_1, reg_data_1);
+    let reg_cell_dep = CellDep::new_builder()
+        .out_point(reg_cell_1)
+        .dep_type(DepType::Code)
+        .build();
+    let state_cell_0 = f.context.create_cell(state_output_0, state_data_0);
+
+    let borrow_tx = TransactionBuilder::default()
+        .cell_dep(reg_cell_dep)
+        .input(
+            CellInput::new_builder()
+                .previous_output(state_cell_0)
+                .build(),
+        )
+        .output(
+            CellOutput::new_builder()
+                .capacity(CAPACITY)
+                .lock(f.admin_lock_script.clone())
+                .type_(Some(state_type_script).pack())
+                .build(),
+        )
+        .output_data(state_data(&item_1, BORROWED))
+        .build();
+    let signed_borrow_tx = f.complete_and_sign(borrow_tx, &admin_privkey);
+    assert!(f.context.verify_tx(&signed_borrow_tx, MAX_CYCLES).is_ok());
+}
+
+// ----------------------------------------------------------------------------
+// 2. Admin Signature Verification Tests (Real secp256k1_blake160_sighash_all)
+// ----------------------------------------------------------------------------
+
+#[test]
+fn atomic_registration_admin_signature_valid_succeeds() {
+    let mut f = AtomicTestFixture::new();
+    let registry_id = [0x44u8; 32];
+    let item_1 = [0x01u8; 32];
+
+    let (tx, _) = f.build_valid_atomic_registration_tx(&registry_id, &[], &item_1);
+    let admin_privkey = f.admin_privkey.clone();
+    let signed_tx = f.complete_and_sign(tx, &admin_privkey);
+
+    assert!(f.context.verify_tx(&signed_tx, MAX_CYCLES).is_ok());
+}
+
+#[test]
+fn atomic_registration_admin_signature_invalid_fails() {
+    let mut f = AtomicTestFixture::new();
+    let registry_id = [0x44u8; 32];
+    let item_1 = [0x01u8; 32];
+
+    let (tx, _) = f.build_valid_atomic_registration_tx(&registry_id, &[], &item_1);
+
+    // 1. Signed with non-admin private key (other_privkey) -> Lock Script rejects
+    let other_privkey = f.other_privkey.clone();
+    let wrong_key_tx = f.complete_and_sign(tx.clone(), &other_privkey);
+    assert_lock_script_error(f.context.verify_tx(&wrong_key_tx, MAX_CYCLES));
+
+    // 2. Corrupted 65-byte signature in WitnessArgs.lock -> Lock Script rejects
+    let corrupted_witness = WitnessArgs::default()
+        .as_builder()
+        .lock(Some(Bytes::from(vec![0xFFu8; 65])).pack())
+        .build();
+    let corrupted_tx = f
+        .complete_without_signing(tx)
+        .as_advanced_builder()
+        .set_witnesses(vec![corrupted_witness.as_bytes().pack()])
+        .build();
+    assert_lock_script_error(f.context.verify_tx(&corrupted_tx, MAX_CYCLES));
+}
+
+#[test]
+fn atomic_registration_admin_signature_missing_fails() {
+    let mut f = AtomicTestFixture::new();
+    let registry_id = [0x44u8; 32];
+    let item_1 = [0x01u8; 32];
+
+    let (tx, _) = f.build_valid_atomic_registration_tx(&registry_id, &[], &item_1);
+
+    // 1. No witnesses present at all -> Lock Script rejects
+    let unsigned_tx = f.complete_without_signing(tx.clone());
+    assert_eq!(unsigned_tx.witnesses().len(), 0);
+    assert_lock_script_error(f.context.verify_tx(&unsigned_tx, MAX_CYCLES));
+
+    // 2. Empty WitnessArgs with lock = None -> Lock Script rejects
+    let empty_witness = WitnessArgs::default();
+    let empty_witness_tx = f
+        .complete_without_signing(tx)
+        .as_advanced_builder()
+        .set_witnesses(vec![empty_witness.as_bytes().pack()])
+        .build();
+    assert_lock_script_error(f.context.verify_tx(&empty_witness_tx, MAX_CYCLES));
+}
+
+// ----------------------------------------------------------------------------
+// 3. Negative State Registration Tests (0 GroupInput -> 1 GroupOutput)
+//    Uses StateTestFixture (real State binary, mock Registry script) so that
+//    State Registration Mode validation is tested directly without pre-emption.
+// ----------------------------------------------------------------------------
+
+#[test]
+fn state_registration_rejects_without_registry_update() {
+    let mut f = StateTestFixture::new();
+    let registry_id = [0x55u8; 32];
+    let item_1 = [0x01u8; 32];
+
+    let reg_args = registry_args(
+        0x01,
+        &registry_id,
+        &f.admin_lock_hash,
+        &f.state_code_hash,
+        f.state_hash_type,
+    );
+    let reg_type_script = f.build_registry_script(reg_args);
+    let reg_type_hash = byte32_to_array(&reg_type_script.calc_script_hash());
+
+    let s_args = state_spec_args(0x01, &item_1, &reg_type_hash, &f.admin_lock_hash);
+    let state_type_script = f.build_state_script(s_args);
+
+    let plain_in = f.context.create_cell(
+        CellOutput::new_builder()
+            .capacity(CAPACITY)
+            .lock(f.admin_lock_script.clone())
+            .build(),
+        Bytes::new(),
+    );
+
+    // Even if a valid Registry CellDep is attached, Registration Mode requires Registry 1->1 in Input/Output
+    let reg_dep = f.create_registry_cell_dep(
+        f.admin_lock_script.clone(),
+        Some(reg_type_script),
+        registry_data(0x01, &registry_id, &[item_1]),
+    );
+
+    let tx = TransactionBuilder::default()
+        .cell_dep(reg_dep)
+        .input(CellInput::new_builder().previous_output(plain_in).build())
+        .output(
+            CellOutput::new_builder()
+                .capacity(CAPACITY)
+                .lock(f.admin_lock_script.clone())
+                .type_(Some(state_type_script).pack())
+                .build(),
+        )
+        .output_data(state_data(&item_1, AVAILABLE))
+        .build();
+    let tx = f.context.complete_tx(tx);
+    assert_script_error(
+        f.context.verify_tx(&tx, MAX_CYCLES),
+        ERROR_UNTRUSTED_REGISTRY,
+    );
+}
+
+#[test]
+fn state_registration_rejects_untrusted_registry_type_hash() {
+    let mut f = StateTestFixture::new();
+    let trusted_registry_id = [0x55u8; 32];
+    let untrusted_registry_id = [0x66u8; 32];
+    let item_1 = [0x01u8; 32];
+
+    let trusted_reg_script = f.build_registry_script(registry_args(
+        0x01,
+        &trusted_registry_id,
+        &f.admin_lock_hash,
+        &f.state_code_hash,
+        f.state_hash_type,
+    ));
+    let trusted_reg_hash = byte32_to_array(&trusted_reg_script.calc_script_hash());
+
+    let untrusted_reg_script = f.build_registry_script(registry_args(
+        0x01,
+        &untrusted_registry_id,
+        &f.admin_lock_hash,
+        &f.state_code_hash,
+        f.state_hash_type,
+    ));
+
+    let reg_in = f.context.create_cell(
+        CellOutput::new_builder()
+            .capacity(CAPACITY)
+            .lock(f.admin_lock_script.clone())
+            .type_(Some(untrusted_reg_script.clone()).pack())
+            .build(),
+        registry_data(0x01, &untrusted_registry_id, &[]),
+    );
+
+    let state_type_script = f.build_state_script(state_spec_args(
+        0x01,
+        &item_1,
+        &trusted_reg_hash,
+        &f.admin_lock_hash,
+    ));
+
+    let tx = TransactionBuilder::default()
+        .input(CellInput::new_builder().previous_output(reg_in).build())
+        .output(
+            CellOutput::new_builder()
+                .capacity(CAPACITY)
+                .lock(f.admin_lock_script.clone())
+                .type_(Some(untrusted_reg_script).pack())
+                .build(),
+        )
+        .output_data(registry_data(0x01, &untrusted_registry_id, &[item_1]))
+        .output(
+            CellOutput::new_builder()
+                .capacity(CAPACITY)
+                .lock(f.admin_lock_script.clone())
+                .type_(Some(state_type_script).pack())
+                .build(),
+        )
+        .output_data(state_data(&item_1, AVAILABLE))
+        .build();
+    let tx = f.context.complete_tx(tx);
+    assert_script_error(
+        f.context.verify_tx(&tx, MAX_CYCLES),
+        ERROR_UNTRUSTED_REGISTRY,
+    );
+}
+
+#[test]
+fn state_registration_rejects_missing_registry_input() {
+    let mut f = StateTestFixture::new();
+    let registry_id = [0x55u8; 32];
+    let item_1 = [0x01u8; 32];
+
+    let reg_type_script = f.build_registry_script(registry_args(
+        0x01,
+        &registry_id,
+        &f.admin_lock_hash,
+        &f.state_code_hash,
+        f.state_hash_type,
+    ));
+    let reg_type_hash = byte32_to_array(&reg_type_script.calc_script_hash());
+    let state_type_script = f.build_state_script(state_spec_args(
+        0x01,
+        &item_1,
+        &reg_type_hash,
+        &f.admin_lock_hash,
+    ));
+
+    let plain_in = f.context.create_cell(
+        CellOutput::new_builder()
+            .capacity(CAPACITY)
+            .lock(f.admin_lock_script.clone())
+            .build(),
+        Bytes::new(),
+    );
+
+    // Registry output is present, but Registry input is missing
+    let tx = TransactionBuilder::default()
+        .input(CellInput::new_builder().previous_output(plain_in).build())
+        .output(
+            CellOutput::new_builder()
+                .capacity(CAPACITY)
+                .lock(f.admin_lock_script.clone())
+                .type_(Some(reg_type_script).pack())
+                .build(),
+        )
+        .output_data(registry_data(0x01, &registry_id, &[item_1]))
+        .output(
+            CellOutput::new_builder()
+                .capacity(CAPACITY)
+                .lock(f.admin_lock_script.clone())
+                .type_(Some(state_type_script).pack())
+                .build(),
+        )
+        .output_data(state_data(&item_1, AVAILABLE))
+        .build();
+    let tx = f.context.complete_tx(tx);
+    assert_script_error(
+        f.context.verify_tx(&tx, MAX_CYCLES),
+        ERROR_UNTRUSTED_REGISTRY,
+    );
+}
+
+#[test]
+fn state_registration_rejects_missing_registry_output() {
+    let mut f = StateTestFixture::new();
+    let registry_id = [0x55u8; 32];
+    let item_1 = [0x01u8; 32];
+
+    let reg_type_script = f.build_registry_script(registry_args(
+        0x01,
+        &registry_id,
+        &f.admin_lock_hash,
+        &f.state_code_hash,
+        f.state_hash_type,
+    ));
+    let reg_type_hash = byte32_to_array(&reg_type_script.calc_script_hash());
+    let state_type_script = f.build_state_script(state_spec_args(
+        0x01,
+        &item_1,
+        &reg_type_hash,
+        &f.admin_lock_hash,
+    ));
+
+    let reg_in = f.context.create_cell(
+        CellOutput::new_builder()
+            .capacity(CAPACITY)
+            .lock(f.admin_lock_script.clone())
+            .type_(Some(reg_type_script).pack())
+            .build(),
+        registry_data(0x01, &registry_id, &[]),
+    );
+
+    // Registry input is present, but Registry output is missing
+    let tx = TransactionBuilder::default()
+        .input(CellInput::new_builder().previous_output(reg_in).build())
+        .output(
+            CellOutput::new_builder()
+                .capacity(CAPACITY)
+                .lock(f.admin_lock_script.clone())
+                .type_(Some(state_type_script).pack())
+                .build(),
+        )
+        .output_data(state_data(&item_1, AVAILABLE))
+        .build();
+    let tx = f.context.complete_tx(tx);
+    assert_script_error(
+        f.context.verify_tx(&tx, MAX_CYCLES),
+        ERROR_UNTRUSTED_REGISTRY,
+    );
+}
+
+#[test]
+fn state_registration_rejects_multiple_registry_inputs() {
+    let mut f = StateTestFixture::new();
+    let registry_id = [0x55u8; 32];
+    let item_1 = [0x01u8; 32];
+
+    let reg_type_script = f.build_registry_script(registry_args(
+        0x01,
+        &registry_id,
+        &f.admin_lock_hash,
+        &f.state_code_hash,
+        f.state_hash_type,
+    ));
+    let reg_type_hash = byte32_to_array(&reg_type_script.calc_script_hash());
+    let state_type_script = f.build_state_script(state_spec_args(
+        0x01,
+        &item_1,
+        &reg_type_hash,
+        &f.admin_lock_hash,
+    ));
+
+    let reg_in_1 = f.context.create_cell(
+        CellOutput::new_builder()
+            .capacity(CAPACITY)
+            .lock(f.admin_lock_script.clone())
+            .type_(Some(reg_type_script.clone()).pack())
+            .build(),
+        registry_data(0x01, &registry_id, &[]),
+    );
+    let reg_in_2 = f.context.create_cell(
+        CellOutput::new_builder()
+            .capacity(CAPACITY)
+            .lock(f.admin_lock_script.clone())
+            .type_(Some(reg_type_script.clone()).pack())
+            .build(),
+        registry_data(0x01, &registry_id, &[]),
+    );
+
+    let tx = TransactionBuilder::default()
+        .input(CellInput::new_builder().previous_output(reg_in_1).build())
+        .input(CellInput::new_builder().previous_output(reg_in_2).build())
+        .output(
+            CellOutput::new_builder()
+                .capacity(CAPACITY)
+                .lock(f.admin_lock_script.clone())
+                .type_(Some(reg_type_script).pack())
+                .build(),
+        )
+        .output_data(registry_data(0x01, &registry_id, &[item_1]))
+        .output(
+            CellOutput::new_builder()
+                .capacity(CAPACITY)
+                .lock(f.admin_lock_script.clone())
+                .type_(Some(state_type_script).pack())
+                .build(),
+        )
+        .output_data(state_data(&item_1, AVAILABLE))
+        .build();
+    let tx = f.context.complete_tx(tx);
+    assert_script_error(f.context.verify_tx(&tx, MAX_CYCLES), ERROR_MULTIPLE_CELLS);
+}
+
+#[test]
+fn state_registration_rejects_multiple_registry_outputs() {
+    let mut f = StateTestFixture::new();
+    let registry_id = [0x55u8; 32];
+    let item_1 = [0x01u8; 32];
+
+    let reg_type_script = f.build_registry_script(registry_args(
+        0x01,
+        &registry_id,
+        &f.admin_lock_hash,
+        &f.state_code_hash,
+        f.state_hash_type,
+    ));
+    let reg_type_hash = byte32_to_array(&reg_type_script.calc_script_hash());
+    let state_type_script = f.build_state_script(state_spec_args(
+        0x01,
+        &item_1,
+        &reg_type_hash,
+        &f.admin_lock_hash,
+    ));
+
+    let reg_in = f.context.create_cell(
+        CellOutput::new_builder()
+            .capacity(CAPACITY)
+            .lock(f.admin_lock_script.clone())
+            .type_(Some(reg_type_script.clone()).pack())
+            .build(),
+        registry_data(0x01, &registry_id, &[]),
+    );
+
+    let tx = TransactionBuilder::default()
+        .input(CellInput::new_builder().previous_output(reg_in).build())
+        .output(
+            CellOutput::new_builder()
+                .capacity(CAPACITY)
+                .lock(f.admin_lock_script.clone())
+                .type_(Some(reg_type_script.clone()).pack())
+                .build(),
+        )
+        .output_data(registry_data(0x01, &registry_id, &[item_1]))
+        .output(
+            CellOutput::new_builder()
+                .capacity(CAPACITY)
+                .lock(f.admin_lock_script.clone())
+                .type_(Some(reg_type_script).pack())
+                .build(),
+        )
+        .output_data(registry_data(0x01, &registry_id, &[item_1]))
+        .output(
+            CellOutput::new_builder()
+                .capacity(CAPACITY)
+                .lock(f.admin_lock_script.clone())
+                .type_(Some(state_type_script).pack())
+                .build(),
+        )
+        .output_data(state_data(&item_1, AVAILABLE))
+        .build();
+    let tx = f.context.complete_tx(tx);
+    assert_script_error(f.context.verify_tx(&tx, MAX_CYCLES), ERROR_MULTIPLE_CELLS);
+}
+
+#[test]
+fn state_registration_rejects_mismatched_appended_item_id() {
+    let mut f = StateTestFixture::new();
+    let registry_id = [0x55u8; 32];
+    let state_item_id = [0x01u8; 32];
+    let registry_appended_id = [0x02u8; 32];
+
+    let reg_type_script = f.build_registry_script(registry_args(
+        0x01,
+        &registry_id,
+        &f.admin_lock_hash,
+        &f.state_code_hash,
+        f.state_hash_type,
+    ));
+    let reg_type_hash = byte32_to_array(&reg_type_script.calc_script_hash());
+    let state_type_script = f.build_state_script(state_spec_args(
+        0x01,
+        &state_item_id,
+        &reg_type_hash,
+        &f.admin_lock_hash,
+    ));
+
+    let reg_in = f.context.create_cell(
+        CellOutput::new_builder()
+            .capacity(CAPACITY)
+            .lock(f.admin_lock_script.clone())
+            .type_(Some(reg_type_script.clone()).pack())
+            .build(),
+        registry_data(0x01, &registry_id, &[]),
+    );
+
+    // Registry appends registry_appended_id (0x02), while State output is for state_item_id (0x01)
+    let tx = TransactionBuilder::default()
+        .input(CellInput::new_builder().previous_output(reg_in).build())
+        .output(
+            CellOutput::new_builder()
+                .capacity(CAPACITY)
+                .lock(f.admin_lock_script.clone())
+                .type_(Some(reg_type_script).pack())
+                .build(),
+        )
+        .output_data(registry_data(0x01, &registry_id, &[registry_appended_id]))
+        .output(
+            CellOutput::new_builder()
+                .capacity(CAPACITY)
+                .lock(f.admin_lock_script.clone())
+                .type_(Some(state_type_script).pack())
+                .build(),
+        )
+        .output_data(state_data(&state_item_id, AVAILABLE))
+        .build();
+    let tx = f.context.complete_tx(tx);
+    assert_script_error(
+        f.context.verify_tx(&tx, MAX_CYCLES),
+        ERROR_UNTRUSTED_REGISTRY,
+    );
+}
+
+#[test]
+fn state_registration_rejects_non_available_initial_status() {
+    let mut f = StateTestFixture::new();
+    let registry_id = [0x55u8; 32];
+    let item_1 = [0x01u8; 32];
+
+    let reg_type_script = f.build_registry_script(registry_args(
+        0x01,
+        &registry_id,
+        &f.admin_lock_hash,
+        &f.state_code_hash,
+        f.state_hash_type,
+    ));
+    let reg_type_hash = byte32_to_array(&reg_type_script.calc_script_hash());
+    let state_type_script = f.build_state_script(state_spec_args(
+        0x01,
+        &item_1,
+        &reg_type_hash,
+        &f.admin_lock_hash,
+    ));
+
+    for bad_status in [BORROWED, RETURNED] {
+        let reg_in = f.context.create_cell(
+            CellOutput::new_builder()
+                .capacity(CAPACITY)
+                .lock(f.admin_lock_script.clone())
+                .type_(Some(reg_type_script.clone()).pack())
+                .build(),
+            registry_data(0x01, &registry_id, &[]),
+        );
+
+        let tx = TransactionBuilder::default()
+            .input(CellInput::new_builder().previous_output(reg_in).build())
+            .output(
+                CellOutput::new_builder()
+                    .capacity(CAPACITY)
+                    .lock(f.admin_lock_script.clone())
+                    .type_(Some(reg_type_script.clone()).pack())
+                    .build(),
+            )
+            .output_data(registry_data(0x01, &registry_id, &[item_1]))
+            .output(
+                CellOutput::new_builder()
+                    .capacity(CAPACITY)
+                    .lock(f.admin_lock_script.clone())
+                    .type_(Some(state_type_script.clone()).pack())
+                    .build(),
+            )
+            .output_data(state_data(&item_1, bad_status))
+            .build();
+        let tx = f.context.complete_tx(tx);
+        assert_script_error(
+            f.context.verify_tx(&tx, MAX_CYCLES),
+            ERROR_INVALID_TRANSITION,
+        );
+    }
+}
+
+#[test]
+fn state_registration_rejects_wrong_state_output_lock() {
+    let mut f = StateTestFixture::new();
+    let registry_id = [0x55u8; 32];
+    let item_1 = [0x01u8; 32];
+
+    let reg_type_script = f.build_registry_script(registry_args(
+        0x01,
+        &registry_id,
+        &f.admin_lock_hash,
+        &f.state_code_hash,
+        f.state_hash_type,
+    ));
+    let reg_type_hash = byte32_to_array(&reg_type_script.calc_script_hash());
+    let state_type_script = f.build_state_script(state_spec_args(
+        0x01,
+        &item_1,
+        &reg_type_hash,
+        &f.admin_lock_hash,
+    ));
+
+    let reg_in = f.context.create_cell(
+        CellOutput::new_builder()
+            .capacity(CAPACITY)
+            .lock(f.admin_lock_script.clone())
+            .type_(Some(reg_type_script.clone()).pack())
+            .build(),
+        registry_data(0x01, &registry_id, &[]),
+    );
+
+    let tx = TransactionBuilder::default()
+        .input(CellInput::new_builder().previous_output(reg_in).build())
+        .output(
+            CellOutput::new_builder()
+                .capacity(CAPACITY)
+                .lock(f.admin_lock_script.clone())
+                .type_(Some(reg_type_script).pack())
+                .build(),
+        )
+        .output_data(registry_data(0x01, &registry_id, &[item_1]))
+        .output(
+            CellOutput::new_builder()
+                .capacity(CAPACITY)
+                .lock(f.other_lock_script.clone())
+                .type_(Some(state_type_script).pack())
+                .build(),
+        )
+        .output_data(state_data(&item_1, AVAILABLE))
+        .build();
+    let tx = f.context.complete_tx(tx);
+    assert_script_error(f.context.verify_tx(&tx, MAX_CYCLES), ERROR_UNAUTHORIZED);
+}
+
+#[test]
+fn state_registration_rejects_missing_admin_locked_input() {
+    let mut f = StateTestFixture::new();
+    let registry_id = [0x55u8; 32];
+    let item_1 = [0x01u8; 32];
+
+    let reg_type_script = f.build_registry_script(registry_args(
+        0x01,
+        &registry_id,
+        &f.admin_lock_hash,
+        &f.state_code_hash,
+        f.state_hash_type,
+    ));
+    let reg_type_hash = byte32_to_array(&reg_type_script.calc_script_hash());
+    let state_type_script = f.build_state_script(state_spec_args(
+        0x01,
+        &item_1,
+        &reg_type_hash,
+        &f.admin_lock_hash,
+    ));
+
+    // Only input in transaction is locked by other_lock_script (no admin-locked input)
+    let non_admin_reg_in = f.context.create_cell(
+        CellOutput::new_builder()
+            .capacity(CAPACITY)
+            .lock(f.other_lock_script.clone())
+            .type_(Some(reg_type_script.clone()).pack())
+            .build(),
+        registry_data(0x01, &registry_id, &[]),
+    );
+
+    let tx = TransactionBuilder::default()
+        .input(
+            CellInput::new_builder()
+                .previous_output(non_admin_reg_in)
+                .build(),
+        )
+        .output(
+            CellOutput::new_builder()
+                .capacity(CAPACITY)
+                .lock(f.admin_lock_script.clone())
+                .type_(Some(reg_type_script).pack())
+                .build(),
+        )
+        .output_data(registry_data(0x01, &registry_id, &[item_1]))
+        .output(
+            CellOutput::new_builder()
+                .capacity(CAPACITY)
+                .lock(f.admin_lock_script.clone())
+                .type_(Some(state_type_script).pack())
+                .build(),
+        )
+        .output_data(state_data(&item_1, AVAILABLE))
+        .build();
+    let tx = f.context.complete_tx(tx);
+    assert_script_error(f.context.verify_tx(&tx, MAX_CYCLES), ERROR_UNAUTHORIZED);
+}
+
+#[test]
+fn state_registration_rejects_invalid_registry_input_or_output_data() {
+    let mut f = StateTestFixture::new();
+    let registry_id = [0x55u8; 32];
+    let item_1 = [0x01u8; 32];
+    let item_2 = [0x02u8; 32];
+
+    let reg_type_script = f.build_registry_script(registry_args(
+        0x01,
+        &registry_id,
+        &f.admin_lock_hash,
+        &f.state_code_hash,
+        f.state_hash_type,
+    ));
+    let reg_type_hash = byte32_to_array(&reg_type_script.calc_script_hash());
+    let state_type_script = f.build_state_script(state_spec_args(
+        0x01,
+        &item_2,
+        &reg_type_hash,
+        &f.admin_lock_hash,
+    ));
+
+    let invalid_cases: Vec<(Bytes, Bytes, i8)> = vec![
+        // 1. Invalid Registry input schema version (0x02) -> ERROR_INVALID_DATA (2)
+        (
+            registry_data(0x02, &registry_id, &[item_1]),
+            registry_data(0x01, &registry_id, &[item_1, item_2]),
+            ERROR_INVALID_DATA,
+        ),
+        // 2. Inconsistent Registry output registry_id -> ERROR_INVALID_DATA (2)
+        (
+            registry_data(0x01, &registry_id, &[item_1]),
+            registry_data(0x01, &[0xFFu8; 32], &[item_1, item_2]),
+            ERROR_INVALID_DATA,
+        ),
+        // 3. Corrupted duplicate items in Registry input -> ERROR_INVALID_DATA (2)
+        (
+            registry_data(0x01, &registry_id, &[item_1, item_1]),
+            registry_data(0x01, &registry_id, &[item_1, item_1, item_2]),
+            ERROR_INVALID_DATA,
+        ),
+        // 4. Malformed Registry output data length (truncated) -> ERROR_INVALID_DATA (2)
+        (
+            registry_data(0x01, &registry_id, &[item_1]),
+            Bytes::from(vec![0x01; 36]),
+            ERROR_INVALID_DATA,
+        ),
+        // 5. Registry output count != input count + 1 (0 -> 2 items) -> ERROR_INVALID_TRANSITION (3)
+        (
+            registry_data(0x01, &registry_id, &[]),
+            registry_data(0x01, &registry_id, &[item_1, item_2]),
+            ERROR_INVALID_TRANSITION,
+        ),
+    ];
+
+    for (in_data, out_data, expected_err) in invalid_cases {
+        let reg_in = f.context.create_cell(
+            CellOutput::new_builder()
+                .capacity(CAPACITY)
+                .lock(f.admin_lock_script.clone())
+                .type_(Some(reg_type_script.clone()).pack())
+                .build(),
+            in_data,
+        );
+
+        let tx = TransactionBuilder::default()
+            .input(CellInput::new_builder().previous_output(reg_in).build())
+            .output(
+                CellOutput::new_builder()
+                    .capacity(CAPACITY)
+                    .lock(f.admin_lock_script.clone())
+                    .type_(Some(reg_type_script.clone()).pack())
+                    .build(),
+            )
+            .output_data(out_data)
+            .output(
+                CellOutput::new_builder()
+                    .capacity(CAPACITY)
+                    .lock(f.admin_lock_script.clone())
+                    .type_(Some(state_type_script.clone()).pack())
+                    .build(),
+            )
+            .output_data(state_data(&item_2, AVAILABLE))
+            .build();
+        let tx = f.context.complete_tx(tx);
+        assert_script_error(f.context.verify_tx(&tx, MAX_CYCLES), expected_err);
+    }
+}
+
+#[test]
+fn state_registration_rejects_altered_registry_prefix() {
+    let mut f = StateTestFixture::new();
+    let registry_id = [0x55u8; 32];
+    let item_1 = [0x01u8; 32];
+    let item_2 = [0x02u8; 32];
+    let item_3 = [0x03u8; 32];
+
+    let reg_type_script = f.build_registry_script(registry_args(
+        0x01,
+        &registry_id,
+        &f.admin_lock_hash,
+        &f.state_code_hash,
+        f.state_hash_type,
+    ));
+    let reg_type_hash = byte32_to_array(&reg_type_script.calc_script_hash());
+    let state_type_script = f.build_state_script(state_spec_args(
+        0x01,
+        &item_3,
+        &reg_type_hash,
+        &f.admin_lock_hash,
+    ));
+
+    let reg_in = f.context.create_cell(
+        CellOutput::new_builder()
+            .capacity(CAPACITY)
+            .lock(f.admin_lock_script.clone())
+            .type_(Some(reg_type_script.clone()).pack())
+            .build(),
+        registry_data(0x01, &registry_id, &[item_1, item_2]),
+    );
+
+    // Reorder existing prefix [item_2, item_1] when registering item_3
+    let tx = TransactionBuilder::default()
+        .input(CellInput::new_builder().previous_output(reg_in).build())
+        .output(
+            CellOutput::new_builder()
+                .capacity(CAPACITY)
+                .lock(f.admin_lock_script.clone())
+                .type_(Some(reg_type_script).pack())
+                .build(),
+        )
+        .output_data(registry_data(0x01, &registry_id, &[item_2, item_1, item_3]))
+        .output(
+            CellOutput::new_builder()
+                .capacity(CAPACITY)
+                .lock(f.admin_lock_script.clone())
+                .type_(Some(state_type_script).pack())
+                .build(),
+        )
+        .output_data(state_data(&item_3, AVAILABLE))
+        .build();
+    let tx = f.context.complete_tx(tx);
+    assert_script_error(
+        f.context.verify_tx(&tx, MAX_CYCLES),
+        ERROR_INVALID_TRANSITION,
+    );
+}
+
+#[test]
+fn state_registration_rejects_duplicate_item_id() {
+    let mut f = StateTestFixture::new();
+    let registry_id = [0x55u8; 32];
+    let item_1 = [0x01u8; 32];
+
+    let reg_type_script = f.build_registry_script(registry_args(
+        0x01,
+        &registry_id,
+        &f.admin_lock_hash,
+        &f.state_code_hash,
+        f.state_hash_type,
+    ));
+    let reg_type_hash = byte32_to_array(&reg_type_script.calc_script_hash());
+    let state_type_script = f.build_state_script(state_spec_args(
+        0x01,
+        &item_1,
+        &reg_type_hash,
+        &f.admin_lock_hash,
+    ));
+
+    let reg_in = f.context.create_cell(
+        CellOutput::new_builder()
+            .capacity(CAPACITY)
+            .lock(f.admin_lock_script.clone())
+            .type_(Some(reg_type_script.clone()).pack())
+            .build(),
+        registry_data(0x01, &registry_id, &[item_1]),
+    );
+
+    let tx = TransactionBuilder::default()
+        .input(CellInput::new_builder().previous_output(reg_in).build())
+        .output(
+            CellOutput::new_builder()
+                .capacity(CAPACITY)
+                .lock(f.admin_lock_script.clone())
+                .type_(Some(reg_type_script).pack())
+                .build(),
+        )
+        .output_data(registry_data(0x01, &registry_id, &[item_1, item_1]))
+        .output(
+            CellOutput::new_builder()
+                .capacity(CAPACITY)
+                .lock(f.admin_lock_script.clone())
+                .type_(Some(state_type_script).pack())
+                .build(),
+        )
+        .output_data(state_data(&item_1, AVAILABLE))
+        .build();
+    let tx = f.context.complete_tx(tx);
+    assert_script_error(f.context.verify_tx(&tx, MAX_CYCLES), ERROR_DUPLICATE_ITEM);
+}
+
+// ----------------------------------------------------------------------------
+// 4. Negative Registry-State Integration Tests (AtomicTestFixture:
+//    Both Real Binaries + Real secp256k1_blake160_sighash_all Admin Signature)
+// ----------------------------------------------------------------------------
+
+#[test]
+fn atomic_registration_rejects_missing_canonical_state_output() {
+    let mut f = AtomicTestFixture::new();
+    let registry_id = [0x44u8; 32];
+    let item_1 = [0x01u8; 32];
+
+    let (reg_type_script, _) = f.build_canonical_registry_script(&registry_id);
+    let reg_in = f.context.create_cell(
+        CellOutput::new_builder()
+            .capacity(CAPACITY * 10)
+            .lock(f.admin_lock_script.clone())
+            .type_(Some(reg_type_script.clone()).pack())
+            .build(),
+        registry_data(0x01, &registry_id, &[]),
+    );
+
+    let tx = TransactionBuilder::default()
+        .input(CellInput::new_builder().previous_output(reg_in).build())
+        .output(
+            CellOutput::new_builder()
+                .capacity(CAPACITY * 10)
+                .lock(f.admin_lock_script.clone())
+                .type_(Some(reg_type_script).pack())
+                .build(),
+        )
+        .output_data(registry_data(0x01, &registry_id, &[item_1]))
+        .build();
+    let admin_privkey = f.admin_privkey.clone();
+    let signed_tx = f.complete_and_sign(tx, &admin_privkey);
+    assert_script_error(
+        f.context.verify_tx(&signed_tx, MAX_CYCLES),
+        ERROR_MISSING_CELL,
+    );
+}
+
+#[test]
+fn atomic_registration_rejects_multiple_canonical_state_outputs() {
+    let mut f = AtomicTestFixture::new();
+    let registry_id = [0x44u8; 32];
+    let item_1 = [0x01u8; 32];
+    let item_2 = [0x02u8; 32];
+
+    let (reg_type_script, reg_type_hash) = f.build_canonical_registry_script(&registry_id);
+    let state_script_1 = f.build_canonical_state_script(&item_1, &reg_type_hash);
+    let state_script_2 = f.build_canonical_state_script(&item_2, &reg_type_hash);
+
+    let reg_in = f.context.create_cell(
+        CellOutput::new_builder()
+            .capacity(CAPACITY * 10)
+            .lock(f.admin_lock_script.clone())
+            .type_(Some(reg_type_script.clone()).pack())
+            .build(),
+        registry_data(0x01, &registry_id, &[]),
+    );
+
+    let tx = TransactionBuilder::default()
+        .input(CellInput::new_builder().previous_output(reg_in).build())
+        .output(
+            CellOutput::new_builder()
+                .capacity(CAPACITY * 10)
+                .lock(f.admin_lock_script.clone())
+                .type_(Some(reg_type_script).pack())
+                .build(),
+        )
+        .output_data(registry_data(0x01, &registry_id, &[item_1]))
+        .output(
+            CellOutput::new_builder()
+                .capacity(CAPACITY)
+                .lock(f.admin_lock_script.clone())
+                .type_(Some(state_script_1).pack())
+                .build(),
+        )
+        .output_data(state_data(&item_1, AVAILABLE))
+        .output(
+            CellOutput::new_builder()
+                .capacity(CAPACITY)
+                .lock(f.admin_lock_script.clone())
+                .type_(Some(state_script_2).pack())
+                .build(),
+        )
+        .output_data(state_data(&item_2, AVAILABLE))
+        .build();
+    let admin_privkey = f.admin_privkey.clone();
+    let signed_tx = f.complete_and_sign(tx, &admin_privkey);
+    assert_script_error(
+        f.context.verify_tx(&signed_tx, MAX_CYCLES),
+        ERROR_MULTIPLE_CELLS,
+    );
+}
+
+#[test]
+fn atomic_registration_rejects_mismatched_state_item_id() {
+    let mut f = AtomicTestFixture::new();
+    let registry_id = [0x44u8; 32];
+    let item_1 = [0x01u8; 32];
+    let item_2 = [0x02u8; 32];
+    let admin_privkey = f.admin_privkey.clone();
+
+    let (reg_type_script, reg_type_hash) = f.build_canonical_registry_script(&registry_id);
+    let state_script_item_1 = f.build_canonical_state_script(&item_1, &reg_type_hash);
+    let state_script_item_2 = f.build_canonical_state_script(&item_2, &reg_type_hash);
+
+    // 1. State Args has item_2 while Registry appends item_1:
+    //    - Inputs[0].Type (Registry group) rejects with ERROR_INVALID_ARGS (1)
+    //    - Outputs[1].Type (State group) rejects with ERROR_UNTRUSTED_REGISTRY (10)
+    let reg_in_1 = f.context.create_cell(
+        CellOutput::new_builder()
+            .capacity(CAPACITY * 10)
+            .lock(f.admin_lock_script.clone())
+            .type_(Some(reg_type_script.clone()).pack())
+            .build(),
+        registry_data(0x01, &registry_id, &[]),
+    );
+    let tx_bad_args_item = TransactionBuilder::default()
+        .input(CellInput::new_builder().previous_output(reg_in_1).build())
+        .output(
+            CellOutput::new_builder()
+                .capacity(CAPACITY * 10)
+                .lock(f.admin_lock_script.clone())
+                .type_(Some(reg_type_script.clone()).pack())
+                .build(),
+        )
+        .output_data(registry_data(0x01, &registry_id, &[item_1]))
+        .output(
+            CellOutput::new_builder()
+                .capacity(CAPACITY)
+                .lock(f.admin_lock_script.clone())
+                .type_(Some(state_script_item_2).pack())
+                .build(),
+        )
+        .output_data(state_data(&item_2, AVAILABLE))
+        .build();
+    let signed_1 = f.complete_and_sign(tx_bad_args_item, &admin_privkey);
+    let res_1 = f.context.verify_tx(&signed_1, MAX_CYCLES);
+    let err_msg_1 = res_1
+        .as_ref()
+        .expect_err("expected atomic registration to fail")
+        .to_string();
+    if err_msg_1.contains("Inputs[0].Type") {
+        assert_script_error(res_1, ERROR_INVALID_ARGS);
+    } else {
+        assert!(err_msg_1.contains("Outputs[1].Type"));
+        assert_script_error(res_1, ERROR_UNTRUSTED_REGISTRY);
+    }
+
+    // 2. State Args has item_1, but State Data has item_2 -> ERROR_INVALID_DATA (2)
+    let reg_in_2 = f.context.create_cell(
+        CellOutput::new_builder()
+            .capacity(CAPACITY * 10)
+            .lock(f.admin_lock_script.clone())
+            .type_(Some(reg_type_script.clone()).pack())
+            .build(),
+        registry_data(0x01, &registry_id, &[]),
+    );
+    let tx_bad_data_item = TransactionBuilder::default()
+        .input(CellInput::new_builder().previous_output(reg_in_2).build())
+        .output(
+            CellOutput::new_builder()
+                .capacity(CAPACITY * 10)
+                .lock(f.admin_lock_script.clone())
+                .type_(Some(reg_type_script).pack())
+                .build(),
+        )
+        .output_data(registry_data(0x01, &registry_id, &[item_1]))
+        .output(
+            CellOutput::new_builder()
+                .capacity(CAPACITY)
+                .lock(f.admin_lock_script.clone())
+                .type_(Some(state_script_item_1).pack())
+                .build(),
+        )
+        .output_data(state_data(&item_2, AVAILABLE))
+        .build();
+    let signed_2 = f.complete_and_sign(tx_bad_data_item, &admin_privkey);
+    assert_script_error(
+        f.context.verify_tx(&signed_2, MAX_CYCLES),
+        ERROR_INVALID_DATA,
+    );
+}
+
+#[test]
+fn atomic_registration_rejects_wrong_state_args() {
+    let mut f = AtomicTestFixture::new();
+    let registry_id = [0x44u8; 32];
+    let item_1 = [0x01u8; 32];
+    let admin_privkey = f.admin_privkey.clone();
+
+    let (reg_type_script, reg_type_hash) = f.build_canonical_registry_script(&registry_id);
+
+    // 1. Wrong trusted_registry_type_hash in State Args -> ERROR_UNTRUSTED_REGISTRY (10)
+    let wrong_reg_hash_script = f.build_state_script(state_spec_args(
+        0x01,
+        &item_1,
+        &[0xFFu8; 32],
+        &f.admin_lock_hash,
+    ));
+    let reg_in_1 = f.context.create_cell(
+        CellOutput::new_builder()
+            .capacity(CAPACITY * 10)
+            .lock(f.admin_lock_script.clone())
+            .type_(Some(reg_type_script.clone()).pack())
+            .build(),
+        registry_data(0x01, &registry_id, &[]),
+    );
+    let tx_wrong_reg_hash = TransactionBuilder::default()
+        .input(CellInput::new_builder().previous_output(reg_in_1).build())
+        .output(
+            CellOutput::new_builder()
+                .capacity(CAPACITY * 10)
+                .lock(f.admin_lock_script.clone())
+                .type_(Some(reg_type_script.clone()).pack())
+                .build(),
+        )
+        .output_data(registry_data(0x01, &registry_id, &[item_1]))
+        .output(
+            CellOutput::new_builder()
+                .capacity(CAPACITY)
+                .lock(f.admin_lock_script.clone())
+                .type_(Some(wrong_reg_hash_script).pack())
+                .build(),
+        )
+        .output_data(state_data(&item_1, AVAILABLE))
+        .build();
+    let signed_1 = f.complete_and_sign(tx_wrong_reg_hash, &admin_privkey);
+    assert_script_error(
+        f.context.verify_tx(&signed_1, MAX_CYCLES),
+        ERROR_UNTRUSTED_REGISTRY,
+    );
+
+    // 2. Wrong version in State Args (0x02) -> ERROR_INVALID_ARGS (1)
+    let wrong_ver_script = f.build_state_script(state_spec_args(
+        0x02,
+        &item_1,
+        &reg_type_hash,
+        &f.admin_lock_hash,
+    ));
+    let reg_in_2 = f.context.create_cell(
+        CellOutput::new_builder()
+            .capacity(CAPACITY * 10)
+            .lock(f.admin_lock_script.clone())
+            .type_(Some(reg_type_script.clone()).pack())
+            .build(),
+        registry_data(0x01, &registry_id, &[]),
+    );
+    let tx_wrong_ver = TransactionBuilder::default()
+        .input(CellInput::new_builder().previous_output(reg_in_2).build())
+        .output(
+            CellOutput::new_builder()
+                .capacity(CAPACITY * 10)
+                .lock(f.admin_lock_script.clone())
+                .type_(Some(reg_type_script).pack())
+                .build(),
+        )
+        .output_data(registry_data(0x01, &registry_id, &[item_1]))
+        .output(
+            CellOutput::new_builder()
+                .capacity(CAPACITY)
+                .lock(f.admin_lock_script.clone())
+                .type_(Some(wrong_ver_script).pack())
+                .build(),
+        )
+        .output_data(state_data(&item_1, AVAILABLE))
+        .build();
+    let signed_2 = f.complete_and_sign(tx_wrong_ver, &admin_privkey);
+    assert_script_error(
+        f.context.verify_tx(&signed_2, MAX_CYCLES),
+        ERROR_INVALID_ARGS,
+    );
+}
+
+#[test]
+fn atomic_registration_rejects_wrong_state_lock() {
+    let mut f = AtomicTestFixture::new();
+    let registry_id = [0x44u8; 32];
+    let item_1 = [0x01u8; 32];
+    let admin_privkey = f.admin_privkey.clone();
+
+    let (reg_type_script, reg_type_hash) = f.build_canonical_registry_script(&registry_id);
+    let state_type_script = f.build_canonical_state_script(&item_1, &reg_type_hash);
+
+    let reg_in = f.context.create_cell(
+        CellOutput::new_builder()
+            .capacity(CAPACITY * 10)
+            .lock(f.admin_lock_script.clone())
+            .type_(Some(reg_type_script.clone()).pack())
+            .build(),
+        registry_data(0x01, &registry_id, &[]),
+    );
+
+    let tx = TransactionBuilder::default()
+        .input(CellInput::new_builder().previous_output(reg_in).build())
+        .output(
+            CellOutput::new_builder()
+                .capacity(CAPACITY * 10)
+                .lock(f.admin_lock_script.clone())
+                .type_(Some(reg_type_script).pack())
+                .build(),
+        )
+        .output_data(registry_data(0x01, &registry_id, &[item_1]))
+        .output(
+            CellOutput::new_builder()
+                .capacity(CAPACITY)
+                .lock(f.other_lock_script.clone())
+                .type_(Some(state_type_script).pack())
+                .build(),
+        )
+        .output_data(state_data(&item_1, AVAILABLE))
+        .build();
+    let signed_tx = f.complete_and_sign(tx, &admin_privkey);
+    assert_script_error(
+        f.context.verify_tx(&signed_tx, MAX_CYCLES),
+        ERROR_UNAUTHORIZED,
+    );
+}
+
+#[test]
+fn atomic_registration_rejects_non_available_state_output() {
+    let mut f = AtomicTestFixture::new();
+    let registry_id = [0x44u8; 32];
+    let item_1 = [0x01u8; 32];
+    let admin_privkey = f.admin_privkey.clone();
+
+    let (reg_type_script, reg_type_hash) = f.build_canonical_registry_script(&registry_id);
+    let state_type_script = f.build_canonical_state_script(&item_1, &reg_type_hash);
+
+    for bad_status in [BORROWED, RETURNED] {
+        let reg_in = f.context.create_cell(
+            CellOutput::new_builder()
+                .capacity(CAPACITY * 10)
+                .lock(f.admin_lock_script.clone())
+                .type_(Some(reg_type_script.clone()).pack())
+                .build(),
+            registry_data(0x01, &registry_id, &[]),
+        );
+
+        let tx = TransactionBuilder::default()
+            .input(CellInput::new_builder().previous_output(reg_in).build())
+            .output(
+                CellOutput::new_builder()
+                    .capacity(CAPACITY * 10)
+                    .lock(f.admin_lock_script.clone())
+                    .type_(Some(reg_type_script.clone()).pack())
+                    .build(),
+            )
+            .output_data(registry_data(0x01, &registry_id, &[item_1]))
+            .output(
+                CellOutput::new_builder()
+                    .capacity(CAPACITY)
+                    .lock(f.admin_lock_script.clone())
+                    .type_(Some(state_type_script.clone()).pack())
+                    .build(),
+            )
+            .output_data(state_data(&item_1, bad_status))
+            .build();
+        let signed_tx = f.complete_and_sign(tx, &admin_privkey);
+        assert_script_error(
+            f.context.verify_tx(&signed_tx, MAX_CYCLES),
+            ERROR_INVALID_TRANSITION,
+        );
+    }
+}
+
+#[test]
+fn atomic_registration_rejects_duplicate_registration() {
+    let mut f = AtomicTestFixture::new();
+    let registry_id = [0x44u8; 32];
+    let item_1 = [0x01u8; 32];
+    let admin_privkey = f.admin_privkey.clone();
+
+    let (tx, _) = f.build_valid_atomic_registration_tx(&registry_id, &[item_1], &item_1);
+    let signed_tx = f.complete_and_sign(tx, &admin_privkey);
+    assert_script_error(
+        f.context.verify_tx(&signed_tx, MAX_CYCLES),
+        ERROR_DUPLICATE_ITEM,
+    );
+}
+
+#[test]
+fn atomic_registration_rejects_invalid_append_only_update() {
+    let mut f = AtomicTestFixture::new();
+    let registry_id = [0x44u8; 32];
+    let item_1 = [0x01u8; 32];
+    let item_2 = [0x02u8; 32];
+    let item_3 = [0x03u8; 32];
+    let admin_privkey = f.admin_privkey.clone();
+
+    let (reg_type_script, reg_type_hash) = f.build_canonical_registry_script(&registry_id);
+    let state_type_script = f.build_canonical_state_script(&item_3, &reg_type_hash);
+
+    // 1. Reorder existing prefix [item_2, item_1, item_3] -> ERROR_INVALID_TRANSITION (3)
+    let reg_in_1 = f.context.create_cell(
+        CellOutput::new_builder()
+            .capacity(CAPACITY * 10)
+            .lock(f.admin_lock_script.clone())
+            .type_(Some(reg_type_script.clone()).pack())
+            .build(),
+        registry_data(0x01, &registry_id, &[item_1, item_2]),
+    );
+    let tx_reordered = TransactionBuilder::default()
+        .input(CellInput::new_builder().previous_output(reg_in_1).build())
+        .output(
+            CellOutput::new_builder()
+                .capacity(CAPACITY * 10)
+                .lock(f.admin_lock_script.clone())
+                .type_(Some(reg_type_script.clone()).pack())
+                .build(),
+        )
+        .output_data(registry_data(0x01, &registry_id, &[item_2, item_1, item_3]))
+        .output(
+            CellOutput::new_builder()
+                .capacity(CAPACITY)
+                .lock(f.admin_lock_script.clone())
+                .type_(Some(state_type_script.clone()).pack())
+                .build(),
+        )
+        .output_data(state_data(&item_3, AVAILABLE))
+        .build();
+    let signed_reordered = f.complete_and_sign(tx_reordered, &admin_privkey);
+    assert_script_error(
+        f.context.verify_tx(&signed_reordered, MAX_CYCLES),
+        ERROR_INVALID_TRANSITION,
+    );
+
+    // 2. Overwrite existing item without incrementing count ([item_1, item_2] -> [item_1, item_3]) -> ERROR_INVALID_TRANSITION (3)
+    let reg_in_2 = f.context.create_cell(
+        CellOutput::new_builder()
+            .capacity(CAPACITY * 10)
+            .lock(f.admin_lock_script.clone())
+            .type_(Some(reg_type_script.clone()).pack())
+            .build(),
+        registry_data(0x01, &registry_id, &[item_1, item_2]),
+    );
+    let tx_overwritten = TransactionBuilder::default()
+        .input(CellInput::new_builder().previous_output(reg_in_2).build())
+        .output(
+            CellOutput::new_builder()
+                .capacity(CAPACITY * 10)
+                .lock(f.admin_lock_script.clone())
+                .type_(Some(reg_type_script).pack())
+                .build(),
+        )
+        .output_data(registry_data(0x01, &registry_id, &[item_1, item_3]))
+        .output(
+            CellOutput::new_builder()
+                .capacity(CAPACITY)
+                .lock(f.admin_lock_script.clone())
+                .type_(Some(state_type_script).pack())
+                .build(),
+        )
+        .output_data(state_data(&item_3, AVAILABLE))
+        .build();
+    let signed_overwritten = f.complete_and_sign(tx_overwritten, &admin_privkey);
+    assert_script_error(
+        f.context.verify_tx(&signed_overwritten, MAX_CYCLES),
+        ERROR_INVALID_TRANSITION,
     );
 }

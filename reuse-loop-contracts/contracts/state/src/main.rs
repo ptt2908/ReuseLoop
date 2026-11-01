@@ -62,17 +62,167 @@ fn run() -> Result<(), i8> {
     let admin_lock_hash = &args[65..97];
 
     // Check group cardinality before loading group cell data:
-    // Exactly 1 State GroupInput -> 1 State GroupOutput is required.
+    // - (0, 1): Registration Mode
+    // - (1, 1): Lifecycle Mode
+    // - (0, 0) or (1, 0): ERROR_MISSING_CELL (4)
+    // - (>1, _) or (_, >1): ERROR_MULTIPLE_CELLS (5)
     let group_in_count = count_group_cells(Source::GroupInput)?;
     let group_out_count = count_group_cells(Source::GroupOutput)?;
 
-    if group_in_count == 0 || group_out_count == 0 {
-        return Err(ERROR_MISSING_CELL);
-    }
     if group_in_count > 1 || group_out_count > 1 {
         return Err(ERROR_MULTIPLE_CELLS);
     }
+    if group_out_count == 0 {
+        return Err(ERROR_MISSING_CELL);
+    }
 
+    if group_in_count == 0 {
+        validate_registration(
+            &script,
+            item_id,
+            trusted_registry_type_hash,
+            admin_lock_hash,
+        )
+    } else {
+        validate_lifecycle(
+            &script,
+            item_id,
+            trusted_registry_type_hash,
+            admin_lock_hash,
+        )
+    }
+}
+
+fn validate_registration(
+    state_script: &Script,
+    item_id: &[u8],
+    trusted_registry_type_hash: &[u8],
+    admin_lock_hash: &[u8],
+) -> Result<(), i8> {
+    // 1. State output Lock Script Hash equals admin_lock_hash
+    let out_lock_hash =
+        load_cell_lock_hash(0, Source::GroupOutput).map_err(|_| ERROR_MISSING_CELL)?;
+    if &out_lock_hash[..] != admin_lock_hash {
+        return Err(ERROR_UNAUTHORIZED);
+    }
+
+    // 2. At least one transaction input has Lock Script Hash equal to admin_lock_hash
+    if !has_admin_input(admin_lock_hash)? {
+        return Err(ERROR_UNAUTHORIZED);
+    }
+
+    // 3. State output occupied capacity is sufficient
+    let out_cap = load_cell_capacity(0, Source::GroupOutput).map_err(|_| ERROR_MISSING_CELL)?;
+    let out_occ =
+        load_cell_occupied_capacity(0, Source::GroupOutput).map_err(|_| ERROR_MISSING_CELL)?;
+    if out_cap < out_occ {
+        return Err(ERROR_CAPACITY);
+    }
+
+    // 4-6. State output data is 34 bytes, schema_version == 0x01, item_id matches State Args
+    let output_data = load_cell_data(0, Source::GroupOutput).map_err(|_| ERROR_MISSING_CELL)?;
+    if !valid_state_data(&output_data, item_id) {
+        return Err(ERROR_INVALID_DATA);
+    }
+
+    // 7. Initial State status is AVAILABLE
+    if output_data[33] != AVAILABLE {
+        return Err(ERROR_INVALID_TRANSITION);
+    }
+
+    // 8. Exactly one Registry input and one Registry output have the trusted Registry Type Script Hash
+    let reg_in_opt = find_unique_registry_cell(Source::Input, trusted_registry_type_hash)?;
+    let reg_out_opt = find_unique_registry_cell(Source::Output, trusted_registry_type_hash)?;
+    let reg_in_idx = reg_in_opt.ok_or(ERROR_UNTRUSTED_REGISTRY)?;
+    let reg_out_idx = reg_out_opt.ok_or(ERROR_UNTRUSTED_REGISTRY)?;
+
+    // 9. Verify Registry input and output Lock Script hashes and canonical Type Script identity
+    let reg_in_lock =
+        load_cell_lock_hash(reg_in_idx, Source::Input).map_err(|_| ERROR_MISSING_CELL)?;
+    let reg_out_lock =
+        load_cell_lock_hash(reg_out_idx, Source::Output).map_err(|_| ERROR_MISSING_CELL)?;
+    if &reg_in_lock[..] != admin_lock_hash || &reg_out_lock[..] != admin_lock_hash {
+        return Err(ERROR_UNAUTHORIZED);
+    }
+
+    let reg_in_type = load_cell_type(reg_in_idx, Source::Input)
+        .map_err(|_| ERROR_MISSING_CELL)?
+        .ok_or(ERROR_UNTRUSTED_REGISTRY)?;
+    let reg_out_type = load_cell_type(reg_out_idx, Source::Output)
+        .map_err(|_| ERROR_MISSING_CELL)?
+        .ok_or(ERROR_UNTRUSTED_REGISTRY)?;
+    if reg_in_type.as_slice() != reg_out_type.as_slice() {
+        return Err(ERROR_UNTRUSTED_REGISTRY);
+    }
+
+    let reg_args = reg_in_type.args().raw_data();
+    if reg_args.len() != REGISTRY_ARGS_LEN || reg_args[0] != SCHEMA_VERSION {
+        return Err(ERROR_INVALID_ARGS);
+    }
+
+    let expected_registry_id = &reg_args[1..33];
+    let reg_admin_lock_hash = &reg_args[33..65];
+    let reg_state_code_hash = &reg_args[65..97];
+    let reg_state_hash_type = reg_args[97];
+
+    if reg_admin_lock_hash != admin_lock_hash {
+        return Err(ERROR_UNAUTHORIZED);
+    }
+
+    if state_script.code_hash().as_slice() != reg_state_code_hash
+        || state_script.hash_type().as_slice()[0] != reg_state_hash_type
+    {
+        return Err(ERROR_UNTRUSTED_REGISTRY);
+    }
+
+    if count_canonical_state_outputs(reg_state_code_hash, reg_state_hash_type)? > 1 {
+        return Err(ERROR_MULTIPLE_CELLS);
+    }
+
+    // 10-11. Registry input/output data is valid and registry_id is consistent
+    let reg_in_data = load_cell_data(reg_in_idx, Source::Input).map_err(|_| ERROR_MISSING_CELL)?;
+    let reg_out_data =
+        load_cell_data(reg_out_idx, Source::Output).map_err(|_| ERROR_MISSING_CELL)?;
+
+    let in_count = parse_registry_header(&reg_in_data, expected_registry_id)?;
+    if has_duplicate_items(&reg_in_data, in_count) {
+        return Err(ERROR_INVALID_DATA);
+    }
+
+    let out_count = parse_registry_header(&reg_out_data, expected_registry_id)?;
+
+    // 12. Registry output count equals Registry input count + 1
+    if out_count != in_count + 1 {
+        return Err(ERROR_INVALID_TRANSITION);
+    }
+
+    // 13. All existing item IDs remain unchanged and in the same order
+    let prefix_end = REGISTRY_HEADER_LEN + ITEM_ID_LEN * in_count;
+    if reg_out_data[REGISTRY_HEADER_LEN..prefix_end] != reg_in_data[REGISTRY_HEADER_LEN..prefix_end]
+    {
+        return Err(ERROR_INVALID_TRANSITION);
+    }
+
+    // 15. The newly appended item ID does not already exist
+    let new_item_id = &reg_out_data[prefix_end..prefix_end + ITEM_ID_LEN];
+    if is_item_registered(&reg_in_data, in_count, new_item_id) {
+        return Err(ERROR_DUPLICATE_ITEM);
+    }
+
+    // 14. The newly appended item ID equals the State item ID
+    if new_item_id != item_id {
+        return Err(ERROR_UNTRUSTED_REGISTRY);
+    }
+
+    Ok(())
+}
+
+fn validate_lifecycle(
+    state_script: &Script,
+    item_id: &[u8],
+    trusted_registry_type_hash: &[u8],
+    admin_lock_hash: &[u8],
+) -> Result<(), i8> {
     // Verify State Input and Output Lock Script hashes equal admin_lock_hash
     let in_lock_hash =
         load_cell_lock_hash(0, Source::GroupInput).map_err(|_| ERROR_MISSING_CELL)?;
@@ -119,7 +269,7 @@ fn run() -> Result<(), i8> {
 
     // Locate and validate the trusted Registry CellDep and verify item_id membership
     validate_registry_celldep(
-        &script,
+        state_script,
         item_id,
         trusted_registry_type_hash,
         admin_lock_hash,
@@ -176,6 +326,75 @@ fn validate_registry_celldep(
     }
 
     Ok(())
+}
+
+fn find_unique_registry_cell(
+    source: Source,
+    trusted_registry_type_hash: &[u8],
+) -> Result<Option<usize>, i8> {
+    let mut matched_index: Option<usize> = None;
+    let mut index = 0;
+
+    loop {
+        match load_cell_type_hash(index, source) {
+            Ok(Some(type_hash)) => {
+                if &type_hash[..] == trusted_registry_type_hash {
+                    if matched_index.is_some() {
+                        return Err(ERROR_MULTIPLE_CELLS);
+                    }
+                    matched_index = Some(index);
+                }
+                index += 1;
+            }
+            Ok(None) => {
+                index += 1;
+            }
+            Err(SysError::IndexOutOfBound) => break,
+            Err(_) => return Err(ERROR_MISSING_CELL),
+        }
+    }
+
+    Ok(matched_index)
+}
+
+fn has_admin_input(admin_lock_hash: &[u8]) -> Result<bool, i8> {
+    let mut index = 0;
+
+    loop {
+        match load_cell_lock_hash(index, Source::Input) {
+            Ok(lock_hash) => {
+                if &lock_hash[..] == admin_lock_hash {
+                    return Ok(true);
+                }
+                index += 1;
+            }
+            Err(SysError::IndexOutOfBound) => return Ok(false),
+            Err(_) => return Err(ERROR_MISSING_CELL),
+        }
+    }
+}
+
+fn count_canonical_state_outputs(state_code_hash: &[u8], state_hash_type: u8) -> Result<usize, i8> {
+    let mut count = 0;
+    let mut index = 0;
+
+    loop {
+        match load_cell_type(index, Source::Output) {
+            Ok(Some(type_script)) => {
+                if type_script.code_hash().as_slice() == state_code_hash
+                    && type_script.hash_type().as_slice()[0] == state_hash_type
+                {
+                    count += 1;
+                }
+                index += 1;
+            }
+            Ok(None) => {
+                index += 1;
+            }
+            Err(SysError::IndexOutOfBound) => return Ok(count),
+            Err(_) => return Err(ERROR_MISSING_CELL),
+        }
+    }
 }
 
 fn find_unique_registry_celldep(trusted_registry_type_hash: &[u8]) -> Result<Option<usize>, i8> {
