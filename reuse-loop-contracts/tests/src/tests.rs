@@ -4,7 +4,7 @@ use ckb_testtool::{
     ckb_hash::new_blake2b,
     ckb_types::{
         bytes::Bytes,
-        core::{ScriptHashType, TransactionBuilder},
+        core::{DepType, ScriptHashType, TransactionBuilder},
         packed::*,
         prelude::*,
     },
@@ -162,12 +162,102 @@ impl RegistryTestFixture {
 
     fn build_canonical_state_script(&mut self, args: Bytes) -> Script {
         self.context
+            .build_script_with_hash_type(&self.state_contract_out_point, ScriptHashType::Type, args)
+            .expect("build canonical state type script")
+    }
+}
+
+struct StateTestFixture {
+    context: Context,
+    state_out_point: OutPoint,
+    state_code_hash: [u8; 32],
+    state_hash_type: u8,
+    admin_lock_script: Script,
+    admin_lock_hash: [u8; 32],
+    other_lock_script: Script,
+    registry_contract_out_point: OutPoint,
+}
+
+impl StateTestFixture {
+    fn new() -> Self {
+        let mut context = Context::default();
+        let state_out_point = context.deploy_cell_by_name("state");
+        let lock_out_point = context.deploy_cell(ALWAYS_SUCCESS.clone());
+
+        let admin_lock_script = context
+            .build_script(&lock_out_point, Bytes::from(vec![0xAA; 20]))
+            .expect("build admin lock script");
+        let admin_lock_hash = byte32_to_array(&admin_lock_script.calc_script_hash());
+
+        let other_lock_script = context
+            .build_script(&lock_out_point, Bytes::from(vec![0xBB; 20]))
+            .expect("build other lock script");
+
+        let dummy_state_script = context
+            .build_script(&state_out_point, Bytes::new())
+            .expect("build dummy state script");
+        let state_code_hash = byte32_to_array(&dummy_state_script.code_hash());
+        let state_hash_type = dummy_state_script.hash_type().as_slice()[0];
+
+        // Deploy a mock Registry code cell backed by ALWAYS_SUCCESS with a unique Type ID
+        // so State script verification can be tested in isolation even when a Registry cell
+        // is placed in Inputs or Outputs.
+        let reg_type_id_script = random_type_id_script();
+        let registry_contract_out_point = context.create_cell(
+            CellOutput::new_builder()
+                .capacity(1000 * 100_000_000u64)
+                .lock(admin_lock_script.clone())
+                .type_(Some(reg_type_id_script).pack())
+                .build(),
+            ALWAYS_SUCCESS.clone(),
+        );
+
+        Self {
+            context,
+            state_out_point,
+            state_code_hash,
+            state_hash_type,
+            admin_lock_script,
+            admin_lock_hash,
+            other_lock_script,
+            registry_contract_out_point,
+        }
+    }
+
+    fn build_state_script(&mut self, args: Bytes) -> Script {
+        self.context
+            .build_script(&self.state_out_point, args)
+            .expect("build state type script")
+    }
+
+    fn build_registry_script(&mut self, args: Bytes) -> Script {
+        self.context
             .build_script_with_hash_type(
-                &self.state_contract_out_point,
+                &self.registry_contract_out_point,
                 ScriptHashType::Type,
                 args,
             )
-            .expect("build canonical state type script")
+            .expect("build registry type script")
+    }
+
+    fn create_registry_cell_dep(
+        &mut self,
+        lock_script: Script,
+        reg_type_script: Option<Script>,
+        data: Bytes,
+    ) -> CellDep {
+        let out_point = self.context.create_cell(
+            CellOutput::new_builder()
+                .capacity(CAPACITY * 10)
+                .lock(lock_script)
+                .type_(reg_type_script.pack())
+                .build(),
+            data,
+        );
+        CellDep::new_builder()
+            .out_point(out_point)
+            .dep_type(DepType::Code)
+            .build()
     }
 }
 
@@ -177,28 +267,37 @@ fn run_transition(
     output_item_id: [u8; 32],
     output_data_override: Option<Bytes>,
 ) -> bool {
-    let mut context = Context::default();
-
-    let state_out_point = context.deploy_cell_by_name("state");
+    let mut f = StateTestFixture::new();
+    let registry_id = [0x55u8; 32];
     let item_id = [7u8; 32];
 
-    let type_script = context
-        .build_script(&state_out_point, Bytes::from(item_id.to_vec()))
-        .expect("build state type script");
+    let reg_args = registry_args(
+        0x01,
+        &registry_id,
+        &f.admin_lock_hash,
+        &f.state_code_hash,
+        f.state_hash_type,
+    );
+    let reg_type_script = f.build_registry_script(reg_args);
+    let reg_type_hash = byte32_to_array(&reg_type_script.calc_script_hash());
 
-    let lock_out_point = context.deploy_cell(ALWAYS_SUCCESS.clone());
-    let lock_script = context
-        .build_script(&lock_out_point, Bytes::new())
-        .expect("build always-success lock script");
+    let reg_cell_dep = f.create_registry_cell_dep(
+        f.admin_lock_script.clone(),
+        Some(reg_type_script),
+        registry_data(0x01, &registry_id, &[item_id]),
+    );
+
+    let s_args = state_spec_args(0x01, &item_id, &reg_type_hash, &f.admin_lock_hash);
+    let type_script = f.build_state_script(s_args);
 
     let input_data = state_data(&item_id, old_status);
-    let output_data = output_data_override
-        .unwrap_or_else(|| state_data(&output_item_id, new_status));
+    let output_data =
+        output_data_override.unwrap_or_else(|| state_data(&output_item_id, new_status));
 
-    let input_out_point = context.create_cell(
+    let input_out_point = f.context.create_cell(
         CellOutput::new_builder()
             .capacity(CAPACITY)
-            .lock(lock_script.clone())
+            .lock(f.admin_lock_script.clone())
             .type_(Some(type_script.clone()).pack())
             .build(),
         input_data,
@@ -210,38 +309,49 @@ fn run_transition(
 
     let output = CellOutput::new_builder()
         .capacity(CAPACITY)
-        .lock(lock_script)
+        .lock(f.admin_lock_script.clone())
         .type_(Some(type_script).pack())
         .build();
 
     let tx = TransactionBuilder::default()
+        .cell_dep(reg_cell_dep)
         .input(input)
         .output(output)
         .output_data(output_data)
         .build();
 
-    let tx = context.complete_tx(tx);
-    context.verify_tx(&tx, MAX_CYCLES).is_ok()
+    let tx = f.context.complete_tx(tx);
+    f.context.verify_tx(&tx, MAX_CYCLES).is_ok()
 }
 
 fn run_with_duplicate_state_outputs() -> bool {
-    let mut context = Context::default();
-    let state_out_point = context.deploy_cell_by_name("state");
+    let mut f = StateTestFixture::new();
+    let registry_id = [0x55u8; 32];
     let item_id = [7u8; 32];
 
-    let type_script = context
-        .build_script(&state_out_point, Bytes::from(item_id.to_vec()))
-        .expect("build state type script");
+    let reg_args = registry_args(
+        0x01,
+        &registry_id,
+        &f.admin_lock_hash,
+        &f.state_code_hash,
+        f.state_hash_type,
+    );
+    let reg_type_script = f.build_registry_script(reg_args);
+    let reg_type_hash = byte32_to_array(&reg_type_script.calc_script_hash());
 
-    let lock_out_point = context.deploy_cell(ALWAYS_SUCCESS.clone());
-    let lock_script = context
-        .build_script(&lock_out_point, Bytes::new())
-        .expect("build always-success lock script");
+    let reg_cell_dep = f.create_registry_cell_dep(
+        f.admin_lock_script.clone(),
+        Some(reg_type_script),
+        registry_data(0x01, &registry_id, &[item_id]),
+    );
 
-    let input_out_point = context.create_cell(
+    let s_args = state_spec_args(0x01, &item_id, &reg_type_hash, &f.admin_lock_hash);
+    let type_script = f.build_state_script(s_args);
+
+    let input_out_point = f.context.create_cell(
         CellOutput::new_builder()
             .capacity(CAPACITY)
-            .lock(lock_script.clone())
+            .lock(f.admin_lock_script.clone())
             .type_(Some(type_script.clone()).pack())
             .build(),
         state_data(&item_id, AVAILABLE),
@@ -255,17 +365,18 @@ fn run_with_duplicate_state_outputs() -> bool {
 
     let output_1 = CellOutput::new_builder()
         .capacity(output_capacity)
-        .lock(lock_script.clone())
+        .lock(f.admin_lock_script.clone())
         .type_(Some(type_script.clone()).pack())
         .build();
 
     let output_2 = CellOutput::new_builder()
         .capacity(output_capacity)
-        .lock(lock_script)
+        .lock(f.admin_lock_script.clone())
         .type_(Some(type_script).pack())
         .build();
 
     let tx = TransactionBuilder::default()
+        .cell_dep(reg_cell_dep)
         .input(input)
         .output(output_1)
         .output_data(state_data(&item_id, BORROWED))
@@ -273,8 +384,8 @@ fn run_with_duplicate_state_outputs() -> bool {
         .output_data(state_data(&item_id, BORROWED))
         .build();
 
-    let tx = context.complete_tx(tx);
-    context.verify_tx(&tx, MAX_CYCLES).is_ok()
+    let tx = f.context.complete_tx(tx);
+    f.context.verify_tx(&tx, MAX_CYCLES).is_ok()
 }
 
 // ============================================================================
@@ -734,10 +845,7 @@ fn registry_genesis_rejects_duplicate_registry_outputs() {
         .build();
 
     let tx = f.context.complete_tx(tx);
-    assert_script_error(
-        f.context.verify_tx(&tx, MAX_CYCLES),
-        ERROR_MULTIPLE_CELLS,
-    );
+    assert_script_error(f.context.verify_tx(&tx, MAX_CYCLES), ERROR_MULTIPLE_CELLS);
 }
 
 #[test]
@@ -1361,10 +1469,7 @@ fn registry_registration_rejects_multiple_canonical_state_outputs() {
         .output_data(state_data(&item_2, AVAILABLE))
         .build();
     let tx = f.context.complete_tx(tx);
-    assert_script_error(
-        f.context.verify_tx(&tx, MAX_CYCLES),
-        ERROR_MULTIPLE_CELLS,
-    );
+    assert_script_error(f.context.verify_tx(&tx, MAX_CYCLES), ERROR_MULTIPLE_CELLS);
 }
 
 #[test]
@@ -1686,5 +1791,1520 @@ fn registry_registration_enforces_max_100_items_limit() {
     assert_script_error(
         f.context.verify_tx(&tx_101, MAX_CYCLES),
         ERROR_CAPACITY_LIMIT,
+    );
+}
+
+// ============================================================================
+// Week 10 CP 10.3: State Script Hardening Tests (1 GroupInput -> 1 GroupOutput)
+// ============================================================================
+
+#[test]
+fn state_lifecycle_allows_full_cycle_with_multi_item_registry_celldep() {
+    let mut f = StateTestFixture::new();
+    let registry_id = [0x55u8; 32];
+    let item_a = [0x10u8; 32];
+    let item_b = [0x20u8; 32];
+    let item_c = [0x30u8; 32];
+
+    let reg_args = registry_args(
+        0x01,
+        &registry_id,
+        &f.admin_lock_hash,
+        &f.state_code_hash,
+        f.state_hash_type,
+    );
+    let reg_type_script = f.build_registry_script(reg_args);
+    let reg_type_hash = byte32_to_array(&reg_type_script.calc_script_hash());
+
+    let reg_cell_dep = f.create_registry_cell_dep(
+        f.admin_lock_script.clone(),
+        Some(reg_type_script),
+        registry_data(0x01, &registry_id, &[item_a, item_b, item_c]),
+    );
+
+    let s_args = state_spec_args(0x01, &item_b, &reg_type_hash, &f.admin_lock_hash);
+    let state_type_script = f.build_state_script(s_args);
+
+    for (old_status, new_status) in [
+        (AVAILABLE, BORROWED),
+        (BORROWED, RETURNED),
+        (RETURNED, AVAILABLE),
+    ] {
+        let in_out_point = f.context.create_cell(
+            CellOutput::new_builder()
+                .capacity(CAPACITY)
+                .lock(f.admin_lock_script.clone())
+                .type_(Some(state_type_script.clone()).pack())
+                .build(),
+            state_data(&item_b, old_status),
+        );
+
+        let tx = TransactionBuilder::default()
+            .cell_dep(reg_cell_dep.clone())
+            .input(
+                CellInput::new_builder()
+                    .previous_output(in_out_point)
+                    .build(),
+            )
+            .output(
+                CellOutput::new_builder()
+                    .capacity(CAPACITY)
+                    .lock(f.admin_lock_script.clone())
+                    .type_(Some(state_type_script.clone()).pack())
+                    .build(),
+            )
+            .output_data(state_data(&item_b, new_status))
+            .build();
+
+        let tx = f.context.complete_tx(tx);
+        assert!(f.context.verify_tx(&tx, MAX_CYCLES).is_ok());
+    }
+}
+
+#[test]
+fn state_rejects_missing_registry_celldep() {
+    let mut f = StateTestFixture::new();
+    let registry_id = [0x55u8; 32];
+    let item_id = [0x11u8; 32];
+
+    let reg_args = registry_args(
+        0x01,
+        &registry_id,
+        &f.admin_lock_hash,
+        &f.state_code_hash,
+        f.state_hash_type,
+    );
+    let reg_type_script = f.build_registry_script(reg_args);
+    let reg_type_hash = byte32_to_array(&reg_type_script.calc_script_hash());
+
+    let s_args = state_spec_args(0x01, &item_id, &reg_type_hash, &f.admin_lock_hash);
+    let state_type_script = f.build_state_script(s_args);
+
+    let in_out_point = f.context.create_cell(
+        CellOutput::new_builder()
+            .capacity(CAPACITY)
+            .lock(f.admin_lock_script.clone())
+            .type_(Some(state_type_script.clone()).pack())
+            .build(),
+        state_data(&item_id, AVAILABLE),
+    );
+
+    // No Registry CellDep included in transaction
+    let tx = TransactionBuilder::default()
+        .input(
+            CellInput::new_builder()
+                .previous_output(in_out_point)
+                .build(),
+        )
+        .output(
+            CellOutput::new_builder()
+                .capacity(CAPACITY)
+                .lock(f.admin_lock_script.clone())
+                .type_(Some(state_type_script).pack())
+                .build(),
+        )
+        .output_data(state_data(&item_id, BORROWED))
+        .build();
+
+    let tx = f.context.complete_tx(tx);
+    assert_script_error(
+        f.context.verify_tx(&tx, MAX_CYCLES),
+        ERROR_UNTRUSTED_REGISTRY,
+    );
+}
+
+#[test]
+fn state_rejects_wrong_registry_type_script_hash() {
+    let mut f = StateTestFixture::new();
+    let trusted_registry_id = [0x55u8; 32];
+    let wrong_registry_id = [0x66u8; 32];
+    let item_id = [0x11u8; 32];
+
+    let trusted_reg_args = registry_args(
+        0x01,
+        &trusted_registry_id,
+        &f.admin_lock_hash,
+        &f.state_code_hash,
+        f.state_hash_type,
+    );
+    let trusted_reg_script = f.build_registry_script(trusted_reg_args);
+    let trusted_reg_type_hash = byte32_to_array(&trusted_reg_script.calc_script_hash());
+
+    let wrong_reg_args = registry_args(
+        0x01,
+        &wrong_registry_id,
+        &f.admin_lock_hash,
+        &f.state_code_hash,
+        f.state_hash_type,
+    );
+    let wrong_reg_script = f.build_registry_script(wrong_reg_args);
+    let wrong_reg_type_hash = byte32_to_array(&wrong_reg_script.calc_script_hash());
+    assert_ne!(trusted_reg_type_hash, wrong_reg_type_hash);
+
+    // 1. CellDep has a different Registry Type Script hash
+    let wrong_reg_dep = f.create_registry_cell_dep(
+        f.admin_lock_script.clone(),
+        Some(wrong_reg_script),
+        registry_data(0x01, &wrong_registry_id, &[item_id]),
+    );
+
+    let s_args = state_spec_args(0x01, &item_id, &trusted_reg_type_hash, &f.admin_lock_hash);
+    let state_type_script = f.build_state_script(s_args);
+
+    let in_out_point = f.context.create_cell(
+        CellOutput::new_builder()
+            .capacity(CAPACITY)
+            .lock(f.admin_lock_script.clone())
+            .type_(Some(state_type_script.clone()).pack())
+            .build(),
+        state_data(&item_id, AVAILABLE),
+    );
+    let state_input = CellInput::new_builder()
+        .previous_output(in_out_point)
+        .build();
+    let state_output = CellOutput::new_builder()
+        .capacity(CAPACITY)
+        .lock(f.admin_lock_script.clone())
+        .type_(Some(state_type_script).pack())
+        .build();
+
+    let tx_wrong_hash = TransactionBuilder::default()
+        .cell_dep(wrong_reg_dep)
+        .input(state_input.clone())
+        .output(state_output.clone())
+        .output_data(state_data(&item_id, BORROWED))
+        .build();
+    let tx_wrong_hash = f.context.complete_tx(tx_wrong_hash);
+    assert_script_error(
+        f.context.verify_tx(&tx_wrong_hash, MAX_CYCLES),
+        ERROR_UNTRUSTED_REGISTRY,
+    );
+
+    // 2. CellDep has valid Registry data bytes but no Type Script (type_ = None)
+    let typeless_reg_dep = f.create_registry_cell_dep(
+        f.admin_lock_script.clone(),
+        None,
+        registry_data(0x01, &trusted_registry_id, &[item_id]),
+    );
+    let tx_typeless = TransactionBuilder::default()
+        .cell_dep(typeless_reg_dep)
+        .input(state_input)
+        .output(state_output)
+        .output_data(state_data(&item_id, BORROWED))
+        .build();
+    let tx_typeless = f.context.complete_tx(tx_typeless);
+    assert_script_error(
+        f.context.verify_tx(&tx_typeless, MAX_CYCLES),
+        ERROR_UNTRUSTED_REGISTRY,
+    );
+}
+
+#[test]
+fn state_rejects_duplicate_matching_registry_celldeps() {
+    let mut f = StateTestFixture::new();
+    let registry_id = [0x55u8; 32];
+    let item_id = [0x11u8; 32];
+
+    let reg_args = registry_args(
+        0x01,
+        &registry_id,
+        &f.admin_lock_hash,
+        &f.state_code_hash,
+        f.state_hash_type,
+    );
+    let reg_type_script = f.build_registry_script(reg_args);
+    let reg_type_hash = byte32_to_array(&reg_type_script.calc_script_hash());
+
+    let reg_dep_1 = f.create_registry_cell_dep(
+        f.admin_lock_script.clone(),
+        Some(reg_type_script.clone()),
+        registry_data(0x01, &registry_id, &[item_id]),
+    );
+    let reg_dep_2 = f.create_registry_cell_dep(
+        f.admin_lock_script.clone(),
+        Some(reg_type_script),
+        registry_data(0x01, &registry_id, &[item_id]),
+    );
+
+    let s_args = state_spec_args(0x01, &item_id, &reg_type_hash, &f.admin_lock_hash);
+    let state_type_script = f.build_state_script(s_args);
+
+    let in_out_point = f.context.create_cell(
+        CellOutput::new_builder()
+            .capacity(CAPACITY)
+            .lock(f.admin_lock_script.clone())
+            .type_(Some(state_type_script.clone()).pack())
+            .build(),
+        state_data(&item_id, AVAILABLE),
+    );
+
+    let tx = TransactionBuilder::default()
+        .cell_dep(reg_dep_1)
+        .cell_dep(reg_dep_2)
+        .input(
+            CellInput::new_builder()
+                .previous_output(in_out_point)
+                .build(),
+        )
+        .output(
+            CellOutput::new_builder()
+                .capacity(CAPACITY)
+                .lock(f.admin_lock_script.clone())
+                .type_(Some(state_type_script).pack())
+                .build(),
+        )
+        .output_data(state_data(&item_id, BORROWED))
+        .build();
+
+    let tx = f.context.complete_tx(tx);
+    assert_script_error(
+        f.context.verify_tx(&tx, MAX_CYCLES),
+        ERROR_UNTRUSTED_REGISTRY,
+    );
+}
+
+#[test]
+fn state_rejects_incorrect_registry_celldep_lock_hash() {
+    let mut f = StateTestFixture::new();
+    let registry_id = [0x55u8; 32];
+    let item_id = [0x11u8; 32];
+
+    let reg_args = registry_args(
+        0x01,
+        &registry_id,
+        &f.admin_lock_hash,
+        &f.state_code_hash,
+        f.state_hash_type,
+    );
+    let reg_type_script = f.build_registry_script(reg_args);
+    let reg_type_hash = byte32_to_array(&reg_type_script.calc_script_hash());
+
+    // Registry CellDep cell is locked by other_lock_script instead of admin_lock_script
+    let bad_lock_reg_dep = f.create_registry_cell_dep(
+        f.other_lock_script.clone(),
+        Some(reg_type_script),
+        registry_data(0x01, &registry_id, &[item_id]),
+    );
+
+    let s_args = state_spec_args(0x01, &item_id, &reg_type_hash, &f.admin_lock_hash);
+    let state_type_script = f.build_state_script(s_args);
+
+    let in_out_point = f.context.create_cell(
+        CellOutput::new_builder()
+            .capacity(CAPACITY)
+            .lock(f.admin_lock_script.clone())
+            .type_(Some(state_type_script.clone()).pack())
+            .build(),
+        state_data(&item_id, AVAILABLE),
+    );
+
+    let tx = TransactionBuilder::default()
+        .cell_dep(bad_lock_reg_dep)
+        .input(
+            CellInput::new_builder()
+                .previous_output(in_out_point)
+                .build(),
+        )
+        .output(
+            CellOutput::new_builder()
+                .capacity(CAPACITY)
+                .lock(f.admin_lock_script.clone())
+                .type_(Some(state_type_script).pack())
+                .build(),
+        )
+        .output_data(state_data(&item_id, BORROWED))
+        .build();
+
+    let tx = f.context.complete_tx(tx);
+    assert_script_error(f.context.verify_tx(&tx, MAX_CYCLES), ERROR_UNAUTHORIZED);
+}
+
+#[test]
+fn state_rejects_incorrect_registry_args_length() {
+    let mut f = StateTestFixture::new();
+    let registry_id = [0x55u8; 32];
+    let item_id = [0x11u8; 32];
+
+    for bad_reg_args in [
+        Bytes::from(vec![0x01; 97]), // 97-byte short args
+        Bytes::from(vec![0x01; 99]), // 99-byte long args
+    ] {
+        let bad_reg_script = f.build_registry_script(bad_reg_args);
+        let bad_reg_type_hash = byte32_to_array(&bad_reg_script.calc_script_hash());
+        let bad_reg_dep = f.create_registry_cell_dep(
+            f.admin_lock_script.clone(),
+            Some(bad_reg_script),
+            registry_data(0x01, &registry_id, &[item_id]),
+        );
+
+        let s_args = state_spec_args(0x01, &item_id, &bad_reg_type_hash, &f.admin_lock_hash);
+        let state_script = f.build_state_script(s_args);
+        let in_out_point = f.context.create_cell(
+            CellOutput::new_builder()
+                .capacity(CAPACITY)
+                .lock(f.admin_lock_script.clone())
+                .type_(Some(state_script.clone()).pack())
+                .build(),
+            state_data(&item_id, AVAILABLE),
+        );
+        let tx = TransactionBuilder::default()
+            .cell_dep(bad_reg_dep)
+            .input(
+                CellInput::new_builder()
+                    .previous_output(in_out_point)
+                    .build(),
+            )
+            .output(
+                CellOutput::new_builder()
+                    .capacity(CAPACITY)
+                    .lock(f.admin_lock_script.clone())
+                    .type_(Some(state_script).pack())
+                    .build(),
+            )
+            .output_data(state_data(&item_id, BORROWED))
+            .build();
+        let tx = f.context.complete_tx(tx);
+        assert_script_error(f.context.verify_tx(&tx, MAX_CYCLES), ERROR_INVALID_ARGS);
+    }
+}
+
+#[test]
+fn state_rejects_incorrect_registry_args_schema_version() {
+    let mut f = StateTestFixture::new();
+    let registry_id = [0x55u8; 32];
+    let item_id = [0x11u8; 32];
+
+    let bad_ver_reg_args = registry_args(
+        0x02,
+        &registry_id,
+        &f.admin_lock_hash,
+        &f.state_code_hash,
+        f.state_hash_type,
+    );
+    let bad_ver_reg_script = f.build_registry_script(bad_ver_reg_args);
+    let bad_ver_reg_type_hash = byte32_to_array(&bad_ver_reg_script.calc_script_hash());
+    let bad_ver_reg_dep = f.create_registry_cell_dep(
+        f.admin_lock_script.clone(),
+        Some(bad_ver_reg_script),
+        registry_data(0x01, &registry_id, &[item_id]),
+    );
+
+    let s_args = state_spec_args(0x01, &item_id, &bad_ver_reg_type_hash, &f.admin_lock_hash);
+    let state_script = f.build_state_script(s_args);
+    let in_out_point = f.context.create_cell(
+        CellOutput::new_builder()
+            .capacity(CAPACITY)
+            .lock(f.admin_lock_script.clone())
+            .type_(Some(state_script.clone()).pack())
+            .build(),
+        state_data(&item_id, AVAILABLE),
+    );
+    let tx_bad_ver = TransactionBuilder::default()
+        .cell_dep(bad_ver_reg_dep)
+        .input(
+            CellInput::new_builder()
+                .previous_output(in_out_point)
+                .build(),
+        )
+        .output(
+            CellOutput::new_builder()
+                .capacity(CAPACITY)
+                .lock(f.admin_lock_script.clone())
+                .type_(Some(state_script).pack())
+                .build(),
+        )
+        .output_data(state_data(&item_id, BORROWED))
+        .build();
+    let tx_bad_ver = f.context.complete_tx(tx_bad_ver);
+    assert_script_error(
+        f.context.verify_tx(&tx_bad_ver, MAX_CYCLES),
+        ERROR_INVALID_ARGS,
+    );
+}
+
+#[test]
+fn state_rejects_incorrect_registry_args_admin_lock_hash() {
+    let mut f = StateTestFixture::new();
+    let registry_id = [0x55u8; 32];
+    let item_id = [0x11u8; 32];
+    let wrong_admin_lock_hash = [0xEEu8; 32];
+
+    // Registry Type Script args[33..65] has wrong_admin_lock_hash != State args admin_lock_hash
+    let reg_args = registry_args(
+        0x01,
+        &registry_id,
+        &wrong_admin_lock_hash,
+        &f.state_code_hash,
+        f.state_hash_type,
+    );
+    let reg_type_script = f.build_registry_script(reg_args);
+    let reg_type_hash = byte32_to_array(&reg_type_script.calc_script_hash());
+
+    let reg_cell_dep = f.create_registry_cell_dep(
+        f.admin_lock_script.clone(),
+        Some(reg_type_script),
+        registry_data(0x01, &registry_id, &[item_id]),
+    );
+
+    let s_args = state_spec_args(0x01, &item_id, &reg_type_hash, &f.admin_lock_hash);
+    let state_type_script = f.build_state_script(s_args);
+
+    let in_out_point = f.context.create_cell(
+        CellOutput::new_builder()
+            .capacity(CAPACITY)
+            .lock(f.admin_lock_script.clone())
+            .type_(Some(state_type_script.clone()).pack())
+            .build(),
+        state_data(&item_id, AVAILABLE),
+    );
+
+    let tx = TransactionBuilder::default()
+        .cell_dep(reg_cell_dep)
+        .input(
+            CellInput::new_builder()
+                .previous_output(in_out_point)
+                .build(),
+        )
+        .output(
+            CellOutput::new_builder()
+                .capacity(CAPACITY)
+                .lock(f.admin_lock_script.clone())
+                .type_(Some(state_type_script).pack())
+                .build(),
+        )
+        .output_data(state_data(&item_id, BORROWED))
+        .build();
+
+    let tx = f.context.complete_tx(tx);
+    assert_script_error(f.context.verify_tx(&tx, MAX_CYCLES), ERROR_UNAUTHORIZED);
+}
+
+#[test]
+fn state_rejects_incorrect_state_code_hash_or_hash_type_in_registry_args() {
+    let mut f = StateTestFixture::new();
+    let registry_id = [0x55u8; 32];
+    let item_id = [0x11u8; 32];
+
+    // 1. Registry Type Script args[65..97] has wrong state_code_hash
+    let bad_code_reg_args = registry_args(
+        0x01,
+        &registry_id,
+        &f.admin_lock_hash,
+        &[0x99u8; 32],
+        f.state_hash_type,
+    );
+    let bad_code_reg_script = f.build_registry_script(bad_code_reg_args);
+    let bad_code_reg_hash = byte32_to_array(&bad_code_reg_script.calc_script_hash());
+    let bad_code_reg_dep = f.create_registry_cell_dep(
+        f.admin_lock_script.clone(),
+        Some(bad_code_reg_script),
+        registry_data(0x01, &registry_id, &[item_id]),
+    );
+
+    let s_args_1 = state_spec_args(0x01, &item_id, &bad_code_reg_hash, &f.admin_lock_hash);
+    let state_script_1 = f.build_state_script(s_args_1);
+    let in_1 = f.context.create_cell(
+        CellOutput::new_builder()
+            .capacity(CAPACITY)
+            .lock(f.admin_lock_script.clone())
+            .type_(Some(state_script_1.clone()).pack())
+            .build(),
+        state_data(&item_id, AVAILABLE),
+    );
+    let tx_bad_code = TransactionBuilder::default()
+        .cell_dep(bad_code_reg_dep)
+        .input(CellInput::new_builder().previous_output(in_1).build())
+        .output(
+            CellOutput::new_builder()
+                .capacity(CAPACITY)
+                .lock(f.admin_lock_script.clone())
+                .type_(Some(state_script_1).pack())
+                .build(),
+        )
+        .output_data(state_data(&item_id, BORROWED))
+        .build();
+    let tx_bad_code = f.context.complete_tx(tx_bad_code);
+    assert_script_error(
+        f.context.verify_tx(&tx_bad_code, MAX_CYCLES),
+        ERROR_UNTRUSTED_REGISTRY,
+    );
+
+    // 2. Registry Type Script args[97] has wrong state_hash_type
+    let wrong_hash_type = if f.state_hash_type == 0x00 {
+        0x01
+    } else {
+        0x00
+    };
+    let bad_ht_reg_args = registry_args(
+        0x01,
+        &registry_id,
+        &f.admin_lock_hash,
+        &f.state_code_hash,
+        wrong_hash_type,
+    );
+    let bad_ht_reg_script = f.build_registry_script(bad_ht_reg_args);
+    let bad_ht_reg_hash = byte32_to_array(&bad_ht_reg_script.calc_script_hash());
+    let bad_ht_reg_dep = f.create_registry_cell_dep(
+        f.admin_lock_script.clone(),
+        Some(bad_ht_reg_script),
+        registry_data(0x01, &registry_id, &[item_id]),
+    );
+
+    let s_args_2 = state_spec_args(0x01, &item_id, &bad_ht_reg_hash, &f.admin_lock_hash);
+    let state_script_2 = f.build_state_script(s_args_2);
+    let in_2 = f.context.create_cell(
+        CellOutput::new_builder()
+            .capacity(CAPACITY)
+            .lock(f.admin_lock_script.clone())
+            .type_(Some(state_script_2.clone()).pack())
+            .build(),
+        state_data(&item_id, AVAILABLE),
+    );
+    let tx_bad_ht = TransactionBuilder::default()
+        .cell_dep(bad_ht_reg_dep)
+        .input(CellInput::new_builder().previous_output(in_2).build())
+        .output(
+            CellOutput::new_builder()
+                .capacity(CAPACITY)
+                .lock(f.admin_lock_script.clone())
+                .type_(Some(state_script_2).pack())
+                .build(),
+        )
+        .output_data(state_data(&item_id, BORROWED))
+        .build();
+    let tx_bad_ht = f.context.complete_tx(tx_bad_ht);
+    assert_script_error(
+        f.context.verify_tx(&tx_bad_ht, MAX_CYCLES),
+        ERROR_UNTRUSTED_REGISTRY,
+    );
+}
+
+#[test]
+fn state_rejects_incorrect_registry_data_schema_version() {
+    let mut f = StateTestFixture::new();
+    let registry_id = [0x55u8; 32];
+    let item_id = [0x11u8; 32];
+
+    let reg_args = registry_args(
+        0x01,
+        &registry_id,
+        &f.admin_lock_hash,
+        &f.state_code_hash,
+        f.state_hash_type,
+    );
+    let reg_type_script = f.build_registry_script(reg_args);
+    let reg_type_hash = byte32_to_array(&reg_type_script.calc_script_hash());
+
+    let s_args = state_spec_args(0x01, &item_id, &reg_type_hash, &f.admin_lock_hash);
+    let state_type_script = f.build_state_script(s_args);
+
+    let in_out_point = f.context.create_cell(
+        CellOutput::new_builder()
+            .capacity(CAPACITY)
+            .lock(f.admin_lock_script.clone())
+            .type_(Some(state_type_script.clone()).pack())
+            .build(),
+        state_data(&item_id, AVAILABLE),
+    );
+
+    let bad_schema_dep = f.create_registry_cell_dep(
+        f.admin_lock_script.clone(),
+        Some(reg_type_script),
+        registry_data(0x02, &registry_id, &[item_id]),
+    );
+    let tx_bad_schema = TransactionBuilder::default()
+        .cell_dep(bad_schema_dep)
+        .input(
+            CellInput::new_builder()
+                .previous_output(in_out_point)
+                .build(),
+        )
+        .output(
+            CellOutput::new_builder()
+                .capacity(CAPACITY)
+                .lock(f.admin_lock_script.clone())
+                .type_(Some(state_type_script).pack())
+                .build(),
+        )
+        .output_data(state_data(&item_id, BORROWED))
+        .build();
+    let tx_bad_schema = f.context.complete_tx(tx_bad_schema);
+    assert_script_error(
+        f.context.verify_tx(&tx_bad_schema, MAX_CYCLES),
+        ERROR_INVALID_DATA,
+    );
+}
+
+#[test]
+fn state_rejects_incorrect_registry_data_length() {
+    let mut f = StateTestFixture::new();
+    let registry_id = [0x55u8; 32];
+    let item_id = [0x11u8; 32];
+
+    let reg_args = registry_args(
+        0x01,
+        &registry_id,
+        &f.admin_lock_hash,
+        &f.state_code_hash,
+        f.state_hash_type,
+    );
+    let reg_type_script = f.build_registry_script(reg_args);
+    let reg_type_hash = byte32_to_array(&reg_type_script.calc_script_hash());
+
+    let s_args = state_spec_args(0x01, &item_id, &reg_type_hash, &f.admin_lock_hash);
+    let state_type_script = f.build_state_script(s_args);
+
+    let in_out_point = f.context.create_cell(
+        CellOutput::new_builder()
+            .capacity(CAPACITY)
+            .lock(f.admin_lock_script.clone())
+            .type_(Some(state_type_script.clone()).pack())
+            .build(),
+        state_data(&item_id, AVAILABLE),
+    );
+    let state_input = CellInput::new_builder()
+        .previous_output(in_out_point)
+        .build();
+    let state_output = CellOutput::new_builder()
+        .capacity(CAPACITY)
+        .lock(f.admin_lock_script.clone())
+        .type_(Some(state_type_script).pack())
+        .build();
+
+    let mut trailing_byte_data = registry_data(0x01, &registry_id, &[item_id]).to_vec();
+    trailing_byte_data.push(0xAA);
+
+    for bad_data in [
+        Bytes::from(vec![0x01; 36]),     // < 37-byte header
+        Bytes::from(trailing_byte_data), // 70 bytes instead of 69 bytes
+    ] {
+        let bad_len_dep = f.create_registry_cell_dep(
+            f.admin_lock_script.clone(),
+            Some(reg_type_script.clone()),
+            bad_data,
+        );
+        let tx = TransactionBuilder::default()
+            .cell_dep(bad_len_dep)
+            .input(state_input.clone())
+            .output(state_output.clone())
+            .output_data(state_data(&item_id, BORROWED))
+            .build();
+        let tx = f.context.complete_tx(tx);
+        assert_script_error(f.context.verify_tx(&tx, MAX_CYCLES), ERROR_INVALID_DATA);
+    }
+}
+
+#[test]
+fn state_rejects_incorrect_registry_data_registry_id() {
+    let mut f = StateTestFixture::new();
+    let registry_id = [0x55u8; 32];
+    let item_id = [0x11u8; 32];
+
+    let reg_args = registry_args(
+        0x01,
+        &registry_id,
+        &f.admin_lock_hash,
+        &f.state_code_hash,
+        f.state_hash_type,
+    );
+    let reg_type_script = f.build_registry_script(reg_args);
+    let reg_type_hash = byte32_to_array(&reg_type_script.calc_script_hash());
+
+    // Registry Data has [0xFF; 32] as registry_id instead of registry_id ([0x55; 32])
+    let bad_id_dep = f.create_registry_cell_dep(
+        f.admin_lock_script.clone(),
+        Some(reg_type_script),
+        registry_data(0x01, &[0xFFu8; 32], &[item_id]),
+    );
+
+    let s_args = state_spec_args(0x01, &item_id, &reg_type_hash, &f.admin_lock_hash);
+    let state_type_script = f.build_state_script(s_args);
+
+    let in_out_point = f.context.create_cell(
+        CellOutput::new_builder()
+            .capacity(CAPACITY)
+            .lock(f.admin_lock_script.clone())
+            .type_(Some(state_type_script.clone()).pack())
+            .build(),
+        state_data(&item_id, AVAILABLE),
+    );
+
+    let tx = TransactionBuilder::default()
+        .cell_dep(bad_id_dep)
+        .input(
+            CellInput::new_builder()
+                .previous_output(in_out_point)
+                .build(),
+        )
+        .output(
+            CellOutput::new_builder()
+                .capacity(CAPACITY)
+                .lock(f.admin_lock_script.clone())
+                .type_(Some(state_type_script).pack())
+                .build(),
+        )
+        .output_data(state_data(&item_id, BORROWED))
+        .build();
+
+    let tx = f.context.complete_tx(tx);
+    assert_script_error(f.context.verify_tx(&tx, MAX_CYCLES), ERROR_INVALID_DATA);
+}
+
+#[test]
+fn state_rejects_inconsistent_registry_item_count_and_data_length() {
+    let mut f = StateTestFixture::new();
+    let registry_id = [0x55u8; 32];
+    let item_id = [0x11u8; 32];
+
+    let reg_args = registry_args(
+        0x01,
+        &registry_id,
+        &f.admin_lock_hash,
+        &f.state_code_hash,
+        f.state_hash_type,
+    );
+    let reg_type_script = f.build_registry_script(reg_args);
+    let reg_type_hash = byte32_to_array(&reg_type_script.calc_script_hash());
+
+    let s_args = state_spec_args(0x01, &item_id, &reg_type_hash, &f.admin_lock_hash);
+    let state_type_script = f.build_state_script(s_args);
+
+    let in_out_point = f.context.create_cell(
+        CellOutput::new_builder()
+            .capacity(CAPACITY)
+            .lock(f.admin_lock_script.clone())
+            .type_(Some(state_type_script.clone()).pack())
+            .build(),
+        state_data(&item_id, AVAILABLE),
+    );
+    let state_input = CellInput::new_builder()
+        .previous_output(in_out_point)
+        .build();
+    let state_output = CellOutput::new_builder()
+        .capacity(CAPACITY)
+        .lock(f.admin_lock_script.clone())
+        .type_(Some(state_type_script).pack())
+        .build();
+
+    // 1. Header claims item_count = 2, but payload only has 1 item (69 bytes != 101 bytes)
+    let mut count_too_high_data = registry_data(0x01, &registry_id, &[item_id]).to_vec();
+    count_too_high_data[33..37].copy_from_slice(&2u32.to_le_bytes());
+
+    // 2. Header claims item_count = 0, but payload has 1 item (69 bytes != 37 bytes)
+    let mut count_too_low_data = registry_data(0x01, &registry_id, &[item_id]).to_vec();
+    count_too_low_data[33..37].copy_from_slice(&0u32.to_le_bytes());
+
+    for bad_data in [
+        Bytes::from(count_too_high_data),
+        Bytes::from(count_too_low_data),
+    ] {
+        let bad_dep = f.create_registry_cell_dep(
+            f.admin_lock_script.clone(),
+            Some(reg_type_script.clone()),
+            bad_data,
+        );
+        let tx = TransactionBuilder::default()
+            .cell_dep(bad_dep)
+            .input(state_input.clone())
+            .output(state_output.clone())
+            .output_data(state_data(&item_id, BORROWED))
+            .build();
+        let tx = f.context.complete_tx(tx);
+        assert_script_error(f.context.verify_tx(&tx, MAX_CYCLES), ERROR_INVALID_DATA);
+    }
+}
+
+#[test]
+fn state_rejects_registry_item_count_exceeding_capacity_limit() {
+    let mut f = StateTestFixture::new();
+    let registry_id = [0x55u8; 32];
+    let item_id = [0x11u8; 32];
+
+    let reg_args = registry_args(
+        0x01,
+        &registry_id,
+        &f.admin_lock_hash,
+        &f.state_code_hash,
+        f.state_hash_type,
+    );
+    let reg_type_script = f.build_registry_script(reg_args);
+    let reg_type_hash = byte32_to_array(&reg_type_script.calc_script_hash());
+
+    let s_args = state_spec_args(0x01, &item_id, &reg_type_hash, &f.admin_lock_hash);
+    let state_type_script = f.build_state_script(s_args);
+
+    let in_out_point = f.context.create_cell(
+        CellOutput::new_builder()
+            .capacity(CAPACITY)
+            .lock(f.admin_lock_script.clone())
+            .type_(Some(state_type_script.clone()).pack())
+            .build(),
+        state_data(&item_id, AVAILABLE),
+    );
+    let state_input = CellInput::new_builder()
+        .previous_output(in_out_point)
+        .build();
+    let state_output = CellOutput::new_builder()
+        .capacity(CAPACITY)
+        .lock(f.admin_lock_script.clone())
+        .type_(Some(state_type_script).pack())
+        .build();
+
+    let mut items_101: Vec<[u8; 32]> = (0u8..100u8)
+        .map(|i| {
+            let mut id = [0u8; 32];
+            id[0] = i + 1;
+            id
+        })
+        .collect();
+    items_101.push(item_id);
+    let over_limit_dep = f.create_registry_cell_dep(
+        f.admin_lock_script.clone(),
+        Some(reg_type_script),
+        registry_data(0x01, &registry_id, &items_101),
+    );
+    let tx_over_limit = TransactionBuilder::default()
+        .cell_dep(over_limit_dep)
+        .input(state_input)
+        .output(state_output)
+        .output_data(state_data(&item_id, BORROWED))
+        .build();
+    let tx_over_limit = f.context.complete_tx(tx_over_limit);
+    assert_script_error(
+        f.context.verify_tx(&tx_over_limit, MAX_CYCLES),
+        ERROR_CAPACITY_LIMIT,
+    );
+}
+
+#[test]
+fn state_rejects_duplicate_item_ids_in_registry_data() {
+    let mut f = StateTestFixture::new();
+    let registry_id = [0x55u8; 32];
+    let item_id = [0x11u8; 32];
+
+    let reg_args = registry_args(
+        0x01,
+        &registry_id,
+        &f.admin_lock_hash,
+        &f.state_code_hash,
+        f.state_hash_type,
+    );
+    let reg_type_script = f.build_registry_script(reg_args);
+    let reg_type_hash = byte32_to_array(&reg_type_script.calc_script_hash());
+
+    let dup_reg_dep = f.create_registry_cell_dep(
+        f.admin_lock_script.clone(),
+        Some(reg_type_script),
+        registry_data(0x01, &registry_id, &[item_id, item_id]),
+    );
+
+    let s_args = state_spec_args(0x01, &item_id, &reg_type_hash, &f.admin_lock_hash);
+    let state_type_script = f.build_state_script(s_args);
+
+    let in_out_point = f.context.create_cell(
+        CellOutput::new_builder()
+            .capacity(CAPACITY)
+            .lock(f.admin_lock_script.clone())
+            .type_(Some(state_type_script.clone()).pack())
+            .build(),
+        state_data(&item_id, AVAILABLE),
+    );
+
+    let tx = TransactionBuilder::default()
+        .cell_dep(dup_reg_dep)
+        .input(
+            CellInput::new_builder()
+                .previous_output(in_out_point)
+                .build(),
+        )
+        .output(
+            CellOutput::new_builder()
+                .capacity(CAPACITY)
+                .lock(f.admin_lock_script.clone())
+                .type_(Some(state_type_script).pack())
+                .build(),
+        )
+        .output_data(state_data(&item_id, BORROWED))
+        .build();
+
+    let tx = f.context.complete_tx(tx);
+    assert_script_error(f.context.verify_tx(&tx, MAX_CYCLES), ERROR_DUPLICATE_ITEM);
+}
+
+#[test]
+fn state_rejects_unregistered_target_item_id() {
+    let mut f = StateTestFixture::new();
+    let registry_id = [0x55u8; 32];
+    let registered_1 = [0x01u8; 32];
+    let registered_2 = [0x02u8; 32];
+    let unregistered_target = [0x99u8; 32];
+
+    let reg_args = registry_args(
+        0x01,
+        &registry_id,
+        &f.admin_lock_hash,
+        &f.state_code_hash,
+        f.state_hash_type,
+    );
+    let reg_type_script = f.build_registry_script(reg_args);
+    let reg_type_hash = byte32_to_array(&reg_type_script.calc_script_hash());
+
+    let reg_cell_dep = f.create_registry_cell_dep(
+        f.admin_lock_script.clone(),
+        Some(reg_type_script),
+        registry_data(0x01, &registry_id, &[registered_1, registered_2]),
+    );
+
+    let s_args = state_spec_args(
+        0x01,
+        &unregistered_target,
+        &reg_type_hash,
+        &f.admin_lock_hash,
+    );
+    let state_type_script = f.build_state_script(s_args);
+
+    let in_out_point = f.context.create_cell(
+        CellOutput::new_builder()
+            .capacity(CAPACITY)
+            .lock(f.admin_lock_script.clone())
+            .type_(Some(state_type_script.clone()).pack())
+            .build(),
+        state_data(&unregistered_target, AVAILABLE),
+    );
+
+    let tx = TransactionBuilder::default()
+        .cell_dep(reg_cell_dep)
+        .input(
+            CellInput::new_builder()
+                .previous_output(in_out_point)
+                .build(),
+        )
+        .output(
+            CellOutput::new_builder()
+                .capacity(CAPACITY)
+                .lock(f.admin_lock_script.clone())
+                .type_(Some(state_type_script).pack())
+                .build(),
+        )
+        .output_data(state_data(&unregistered_target, BORROWED))
+        .build();
+
+    let tx = f.context.complete_tx(tx);
+    assert_script_error(
+        f.context.verify_tx(&tx, MAX_CYCLES),
+        ERROR_UNTRUSTED_REGISTRY,
+    );
+}
+
+#[test]
+fn state_rejects_registry_present_in_inputs_or_outputs() {
+    let mut f = StateTestFixture::new();
+    let registry_id = [0x55u8; 32];
+    let item_id = [0x11u8; 32];
+
+    let reg_args = registry_args(
+        0x01,
+        &registry_id,
+        &f.admin_lock_hash,
+        &f.state_code_hash,
+        f.state_hash_type,
+    );
+    let reg_type_script = f.build_registry_script(reg_args);
+    let reg_type_hash = byte32_to_array(&reg_type_script.calc_script_hash());
+
+    let reg_cell_dep = f.create_registry_cell_dep(
+        f.admin_lock_script.clone(),
+        Some(reg_type_script.clone()),
+        registry_data(0x01, &registry_id, &[item_id]),
+    );
+
+    let s_args = state_spec_args(0x01, &item_id, &reg_type_hash, &f.admin_lock_hash);
+    let state_type_script = f.build_state_script(s_args);
+
+    let state_in_out_point = f.context.create_cell(
+        CellOutput::new_builder()
+            .capacity(CAPACITY)
+            .lock(f.admin_lock_script.clone())
+            .type_(Some(state_type_script.clone()).pack())
+            .build(),
+        state_data(&item_id, AVAILABLE),
+    );
+    let state_input = CellInput::new_builder()
+        .previous_output(state_in_out_point)
+        .build();
+    let state_output = CellOutput::new_builder()
+        .capacity(CAPACITY)
+        .lock(f.admin_lock_script.clone())
+        .type_(Some(state_type_script).pack())
+        .build();
+
+    // 1. Registry cell present in transaction Inputs
+    let reg_in_out_point = f.context.create_cell(
+        CellOutput::new_builder()
+            .capacity(CAPACITY)
+            .lock(f.admin_lock_script.clone())
+            .type_(Some(reg_type_script.clone()).pack())
+            .build(),
+        registry_data(0x01, &registry_id, &[item_id]),
+    );
+    let tx_reg_in_input = TransactionBuilder::default()
+        .cell_dep(reg_cell_dep.clone())
+        .input(state_input.clone())
+        .input(
+            CellInput::new_builder()
+                .previous_output(reg_in_out_point)
+                .build(),
+        )
+        .output(state_output.clone())
+        .output_data(state_data(&item_id, BORROWED))
+        .build();
+    let tx_reg_in_input = f.context.complete_tx(tx_reg_in_input);
+    assert_script_error(
+        f.context.verify_tx(&tx_reg_in_input, MAX_CYCLES),
+        ERROR_UNTRUSTED_REGISTRY,
+    );
+
+    // 2. Registry cell present in transaction Outputs
+    let reg_output = CellOutput::new_builder()
+        .capacity(CAPACITY)
+        .lock(f.admin_lock_script.clone())
+        .type_(Some(reg_type_script).pack())
+        .build();
+    let tx_reg_in_output = TransactionBuilder::default()
+        .cell_dep(reg_cell_dep)
+        .input(state_input)
+        .output(state_output)
+        .output_data(state_data(&item_id, BORROWED))
+        .output(reg_output)
+        .output_data(registry_data(0x01, &registry_id, &[item_id]))
+        .build();
+    let tx_reg_in_output = f.context.complete_tx(tx_reg_in_output);
+    assert_script_error(
+        f.context.verify_tx(&tx_reg_in_output, MAX_CYCLES),
+        ERROR_UNTRUSTED_REGISTRY,
+    );
+}
+
+#[test]
+fn state_rejects_invalid_state_args_length_or_version() {
+    let mut f = StateTestFixture::new();
+    let registry_id = [0x55u8; 32];
+    let item_id = [0x11u8; 32];
+
+    let reg_args = registry_args(
+        0x01,
+        &registry_id,
+        &f.admin_lock_hash,
+        &f.state_code_hash,
+        f.state_hash_type,
+    );
+    let reg_type_script = f.build_registry_script(reg_args);
+    let reg_type_hash = byte32_to_array(&reg_type_script.calc_script_hash());
+
+    let reg_cell_dep = f.create_registry_cell_dep(
+        f.admin_lock_script.clone(),
+        Some(reg_type_script),
+        registry_data(0x01, &registry_id, &[item_id]),
+    );
+
+    let invalid_args_cases = [
+        Bytes::from(item_id.to_vec()), // 32B legacy args
+        Bytes::from(vec![0x01; 96]),   // 96B short args
+        Bytes::from(vec![0x01; 98]),   // 98B long args
+        state_spec_args(0x02, &item_id, &reg_type_hash, &f.admin_lock_hash), // 97B wrong version 0x02
+    ];
+
+    for bad_args in invalid_args_cases {
+        let bad_state_script = f.build_state_script(bad_args);
+        let in_out_point = f.context.create_cell(
+            CellOutput::new_builder()
+                .capacity(CAPACITY)
+                .lock(f.admin_lock_script.clone())
+                .type_(Some(bad_state_script.clone()).pack())
+                .build(),
+            state_data(&item_id, AVAILABLE),
+        );
+        let tx = TransactionBuilder::default()
+            .cell_dep(reg_cell_dep.clone())
+            .input(
+                CellInput::new_builder()
+                    .previous_output(in_out_point)
+                    .build(),
+            )
+            .output(
+                CellOutput::new_builder()
+                    .capacity(CAPACITY)
+                    .lock(f.admin_lock_script.clone())
+                    .type_(Some(bad_state_script).pack())
+                    .build(),
+            )
+            .output_data(state_data(&item_id, BORROWED))
+            .build();
+        let tx = f.context.complete_tx(tx);
+        assert_script_error(f.context.verify_tx(&tx, MAX_CYCLES), ERROR_INVALID_ARGS);
+    }
+}
+
+#[test]
+fn state_rejects_invalid_state_input_or_output_lock_hash() {
+    let mut f = StateTestFixture::new();
+    let registry_id = [0x55u8; 32];
+    let item_id = [0x11u8; 32];
+
+    let reg_args = registry_args(
+        0x01,
+        &registry_id,
+        &f.admin_lock_hash,
+        &f.state_code_hash,
+        f.state_hash_type,
+    );
+    let reg_type_script = f.build_registry_script(reg_args);
+    let reg_type_hash = byte32_to_array(&reg_type_script.calc_script_hash());
+
+    let reg_cell_dep = f.create_registry_cell_dep(
+        f.admin_lock_script.clone(),
+        Some(reg_type_script),
+        registry_data(0x01, &registry_id, &[item_id]),
+    );
+
+    let s_args = state_spec_args(0x01, &item_id, &reg_type_hash, &f.admin_lock_hash);
+    let state_type_script = f.build_state_script(s_args);
+
+    // 1. State input lock != admin_lock_hash
+    let bad_in_out_point = f.context.create_cell(
+        CellOutput::new_builder()
+            .capacity(CAPACITY)
+            .lock(f.other_lock_script.clone())
+            .type_(Some(state_type_script.clone()).pack())
+            .build(),
+        state_data(&item_id, AVAILABLE),
+    );
+    let tx_bad_in_lock = TransactionBuilder::default()
+        .cell_dep(reg_cell_dep.clone())
+        .input(
+            CellInput::new_builder()
+                .previous_output(bad_in_out_point)
+                .build(),
+        )
+        .output(
+            CellOutput::new_builder()
+                .capacity(CAPACITY)
+                .lock(f.admin_lock_script.clone())
+                .type_(Some(state_type_script.clone()).pack())
+                .build(),
+        )
+        .output_data(state_data(&item_id, BORROWED))
+        .build();
+    let tx_bad_in_lock = f.context.complete_tx(tx_bad_in_lock);
+    assert_script_error(
+        f.context.verify_tx(&tx_bad_in_lock, MAX_CYCLES),
+        ERROR_UNAUTHORIZED,
+    );
+
+    // 2. State output lock != admin_lock_hash
+    let good_in_out_point = f.context.create_cell(
+        CellOutput::new_builder()
+            .capacity(CAPACITY)
+            .lock(f.admin_lock_script.clone())
+            .type_(Some(state_type_script.clone()).pack())
+            .build(),
+        state_data(&item_id, AVAILABLE),
+    );
+    let tx_bad_out_lock = TransactionBuilder::default()
+        .cell_dep(reg_cell_dep)
+        .input(
+            CellInput::new_builder()
+                .previous_output(good_in_out_point)
+                .build(),
+        )
+        .output(
+            CellOutput::new_builder()
+                .capacity(CAPACITY)
+                .lock(f.other_lock_script.clone())
+                .type_(Some(state_type_script).pack())
+                .build(),
+        )
+        .output_data(state_data(&item_id, BORROWED))
+        .build();
+    let tx_bad_out_lock = f.context.complete_tx(tx_bad_out_lock);
+    assert_script_error(
+        f.context.verify_tx(&tx_bad_out_lock, MAX_CYCLES),
+        ERROR_UNAUTHORIZED,
+    );
+}
+
+#[test]
+fn state_rejects_remaining_invalid_lifecycle_transitions_and_cardinality() {
+    let mut f = StateTestFixture::new();
+    let registry_id = [0x55u8; 32];
+    let item_id = [0x11u8; 32];
+
+    let reg_args = registry_args(
+        0x01,
+        &registry_id,
+        &f.admin_lock_hash,
+        &f.state_code_hash,
+        f.state_hash_type,
+    );
+    let reg_type_script = f.build_registry_script(reg_args);
+    let reg_type_hash = byte32_to_array(&reg_type_script.calc_script_hash());
+
+    let reg_cell_dep = f.create_registry_cell_dep(
+        f.admin_lock_script.clone(),
+        Some(reg_type_script),
+        registry_data(0x01, &registry_id, &[item_id]),
+    );
+
+    let s_args = state_spec_args(0x01, &item_id, &reg_type_hash, &f.admin_lock_hash);
+    let state_type_script = f.build_state_script(s_args);
+
+    // 1. Remaining invalid transitions: BORROWED->AVAILABLE, BORROWED->BORROWED, RETURNED->BORROWED, RETURNED->RETURNED
+    for (old_status, new_status) in [
+        (BORROWED, AVAILABLE),
+        (BORROWED, BORROWED),
+        (RETURNED, BORROWED),
+        (RETURNED, RETURNED),
+    ] {
+        let in_out_point = f.context.create_cell(
+            CellOutput::new_builder()
+                .capacity(CAPACITY)
+                .lock(f.admin_lock_script.clone())
+                .type_(Some(state_type_script.clone()).pack())
+                .build(),
+            state_data(&item_id, old_status),
+        );
+        let tx = TransactionBuilder::default()
+            .cell_dep(reg_cell_dep.clone())
+            .input(
+                CellInput::new_builder()
+                    .previous_output(in_out_point)
+                    .build(),
+            )
+            .output(
+                CellOutput::new_builder()
+                    .capacity(CAPACITY)
+                    .lock(f.admin_lock_script.clone())
+                    .type_(Some(state_type_script.clone()).pack())
+                    .build(),
+            )
+            .output_data(state_data(&item_id, new_status))
+            .build();
+        let tx = f.context.complete_tx(tx);
+        assert_script_error(
+            f.context.verify_tx(&tx, MAX_CYCLES),
+            ERROR_INVALID_TRANSITION,
+        );
+    }
+
+    // 2. Missing State GroupInput (0 GroupInput -> 1 GroupOutput) -> ERROR_MISSING_CELL (4)
+    let plain_in = f.context.create_cell(
+        CellOutput::new_builder()
+            .capacity(CAPACITY)
+            .lock(f.admin_lock_script.clone())
+            .build(),
+        Bytes::new(),
+    );
+    let tx_missing_in = TransactionBuilder::default()
+        .cell_dep(reg_cell_dep.clone())
+        .input(CellInput::new_builder().previous_output(plain_in).build())
+        .output(
+            CellOutput::new_builder()
+                .capacity(CAPACITY)
+                .lock(f.admin_lock_script.clone())
+                .type_(Some(state_type_script.clone()).pack())
+                .build(),
+        )
+        .output_data(state_data(&item_id, AVAILABLE))
+        .build();
+    let tx_missing_in = f.context.complete_tx(tx_missing_in);
+    assert_script_error(
+        f.context.verify_tx(&tx_missing_in, MAX_CYCLES),
+        ERROR_MISSING_CELL,
+    );
+
+    // 3. State burn / missing State GroupOutput (1 GroupInput -> 0 GroupOutput) -> ERROR_MISSING_CELL (4)
+    let burn_in = f.context.create_cell(
+        CellOutput::new_builder()
+            .capacity(CAPACITY)
+            .lock(f.admin_lock_script.clone())
+            .type_(Some(state_type_script.clone()).pack())
+            .build(),
+        state_data(&item_id, AVAILABLE),
+    );
+    let tx_burn = TransactionBuilder::default()
+        .cell_dep(reg_cell_dep.clone())
+        .input(CellInput::new_builder().previous_output(burn_in).build())
+        .output(
+            CellOutput::new_builder()
+                .capacity(CAPACITY)
+                .lock(f.admin_lock_script.clone())
+                .build(),
+        )
+        .output_data(Bytes::new())
+        .build();
+    let tx_burn = f.context.complete_tx(tx_burn);
+    assert_script_error(
+        f.context.verify_tx(&tx_burn, MAX_CYCLES),
+        ERROR_MISSING_CELL,
+    );
+
+    // 4. Multiple State GroupInputs (2 GroupInput -> 1 GroupOutput) -> ERROR_MULTIPLE_CELLS (5)
+    let in_1 = f.context.create_cell(
+        CellOutput::new_builder()
+            .capacity(CAPACITY)
+            .lock(f.admin_lock_script.clone())
+            .type_(Some(state_type_script.clone()).pack())
+            .build(),
+        state_data(&item_id, AVAILABLE),
+    );
+    let in_2 = f.context.create_cell(
+        CellOutput::new_builder()
+            .capacity(CAPACITY)
+            .lock(f.admin_lock_script.clone())
+            .type_(Some(state_type_script.clone()).pack())
+            .build(),
+        state_data(&item_id, AVAILABLE),
+    );
+    let tx_multi_in = TransactionBuilder::default()
+        .cell_dep(reg_cell_dep.clone())
+        .input(CellInput::new_builder().previous_output(in_1).build())
+        .input(CellInput::new_builder().previous_output(in_2).build())
+        .output(
+            CellOutput::new_builder()
+                .capacity(CAPACITY)
+                .lock(f.admin_lock_script.clone())
+                .type_(Some(state_type_script.clone()).pack())
+                .build(),
+        )
+        .output_data(state_data(&item_id, BORROWED))
+        .build();
+    let tx_multi_in = f.context.complete_tx(tx_multi_in);
+    assert_script_error(
+        f.context.verify_tx(&tx_multi_in, MAX_CYCLES),
+        ERROR_MULTIPLE_CELLS,
+    );
+
+    // 5. Multiple State GroupOutputs (1 GroupInput -> 2 GroupOutput) -> ERROR_MULTIPLE_CELLS (5)
+    let split_in = f.context.create_cell(
+        CellOutput::new_builder()
+            .capacity(CAPACITY * 2)
+            .lock(f.admin_lock_script.clone())
+            .type_(Some(state_type_script.clone()).pack())
+            .build(),
+        state_data(&item_id, AVAILABLE),
+    );
+    let tx_multi_out = TransactionBuilder::default()
+        .cell_dep(reg_cell_dep)
+        .input(CellInput::new_builder().previous_output(split_in).build())
+        .output(
+            CellOutput::new_builder()
+                .capacity(CAPACITY)
+                .lock(f.admin_lock_script.clone())
+                .type_(Some(state_type_script.clone()).pack())
+                .build(),
+        )
+        .output_data(state_data(&item_id, BORROWED))
+        .output(
+            CellOutput::new_builder()
+                .capacity(CAPACITY)
+                .lock(f.admin_lock_script.clone())
+                .type_(Some(state_type_script).pack())
+                .build(),
+        )
+        .output_data(state_data(&item_id, BORROWED))
+        .build();
+    let tx_multi_out = f.context.complete_tx(tx_multi_out);
+    assert_script_error(
+        f.context.verify_tx(&tx_multi_out, MAX_CYCLES),
+        ERROR_MULTIPLE_CELLS,
+    );
+}
+
+#[test]
+fn state_rejects_capacity_regression_or_insufficient_occupied_capacity() {
+    let mut f = StateTestFixture::new();
+    let registry_id = [0x55u8; 32];
+    let item_id = [0x11u8; 32];
+
+    let reg_args = registry_args(
+        0x01,
+        &registry_id,
+        &f.admin_lock_hash,
+        &f.state_code_hash,
+        f.state_hash_type,
+    );
+    let reg_type_script = f.build_registry_script(reg_args);
+    let reg_type_hash = byte32_to_array(&reg_type_script.calc_script_hash());
+
+    let reg_cell_dep = f.create_registry_cell_dep(
+        f.admin_lock_script.clone(),
+        Some(reg_type_script),
+        registry_data(0x01, &registry_id, &[item_id]),
+    );
+
+    let s_args = state_spec_args(0x01, &item_id, &reg_type_hash, &f.admin_lock_hash);
+    let state_type_script = f.build_state_script(s_args);
+
+    // 1. Output capacity < Input capacity (CAPACITY - 1 < CAPACITY) -> ERROR_CAPACITY (7)
+    let in_out_point = f.context.create_cell(
+        CellOutput::new_builder()
+            .capacity(CAPACITY)
+            .lock(f.admin_lock_script.clone())
+            .type_(Some(state_type_script.clone()).pack())
+            .build(),
+        state_data(&item_id, AVAILABLE),
+    );
+    let tx_reduced_cap = TransactionBuilder::default()
+        .cell_dep(reg_cell_dep.clone())
+        .input(
+            CellInput::new_builder()
+                .previous_output(in_out_point)
+                .build(),
+        )
+        .output(
+            CellOutput::new_builder()
+                .capacity(CAPACITY - 1)
+                .lock(f.admin_lock_script.clone())
+                .type_(Some(state_type_script.clone()).pack())
+                .build(),
+        )
+        .output_data(state_data(&item_id, BORROWED))
+        .build();
+    let tx_reduced_cap = f.context.complete_tx(tx_reduced_cap);
+    assert_script_error(
+        f.context.verify_tx(&tx_reduced_cap, MAX_CYCLES),
+        ERROR_CAPACITY,
+    );
+
+    // 2. Output capacity < Occupied capacity (100 CKB < 225 CKB) -> ERROR_CAPACITY (7)
+    let underfunded_cap = 100 * 100_000_000u64;
+    let underfunded_in = f.context.create_cell(
+        CellOutput::new_builder()
+            .capacity(underfunded_cap)
+            .lock(f.admin_lock_script.clone())
+            .type_(Some(state_type_script.clone()).pack())
+            .build(),
+        state_data(&item_id, AVAILABLE),
+    );
+    let tx_underfunded = TransactionBuilder::default()
+        .cell_dep(reg_cell_dep)
+        .input(
+            CellInput::new_builder()
+                .previous_output(underfunded_in)
+                .build(),
+        )
+        .output(
+            CellOutput::new_builder()
+                .capacity(underfunded_cap)
+                .lock(f.admin_lock_script.clone())
+                .type_(Some(state_type_script).pack())
+                .build(),
+        )
+        .output_data(state_data(&item_id, BORROWED))
+        .build();
+    let tx_underfunded = f.context.complete_tx(tx_underfunded);
+    assert_script_error(
+        f.context.verify_tx(&tx_underfunded, MAX_CYCLES),
+        ERROR_CAPACITY,
     );
 }
