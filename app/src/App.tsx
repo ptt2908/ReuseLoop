@@ -62,6 +62,7 @@ export default function App() {
   const [genesisSigningStatus, setGenesisSigningStatus] = useState("");
   const [signedTransaction, setSignedTransaction] = useState<ccc.Transaction | null>(null);
   const [signingBusy, setSigningBusy] = useState(false);
+  const [registrationSigningBusy, setRegistrationSigningBusy] = useState(false);
   const [signingError, setSigningError] = useState("");
   const [signingStatus, setSigningStatus] = useState("");
   const [confirmationBusy, setConfirmationBusy] = useState(false);
@@ -129,7 +130,7 @@ export default function App() {
   }
 
   async function disconnectWallet() {
-    if (!wallet || signingBusy || genesisSigningBusy) {
+    if (!wallet || signingBusy || genesisSigningBusy || registrationSigningBusy) {
       return;
     }
 
@@ -165,6 +166,7 @@ export default function App() {
   ) {
     if (
       genesisSigningBusy ||
+      registrationSigningBusy ||
       genesisSignedTransaction ||
       genesisSubmissionComplete ||
       genesisSubmissionOutcomeUncertain
@@ -253,6 +255,7 @@ export default function App() {
       !stateArtifact ||
       genesisBusy ||
       genesisSigningBusy ||
+      registrationSigningBusy ||
       genesisSignedTransaction ||
       genesisSubmissionComplete ||
       genesisSubmissionOutcomeUncertain
@@ -297,6 +300,7 @@ export default function App() {
       !genesisPreview ||
       genesisSignedTransaction ||
       genesisSigningBusy ||
+      registrationSigningBusy ||
       genesisBusy
     ) {
       return;
@@ -539,7 +543,7 @@ export default function App() {
     ? JSON.stringify(JSON.parse(ccc.stringify(deploymentPreview.transaction)), null, 2)
     : "";
   async function signDeploymentPreview() {
-    if (!wallet || !deploymentPreview || signedTransaction || signingBusy) {
+    if (!wallet || !deploymentPreview || signedTransaction || signingBusy || registrationSigningBusy || genesisSigningBusy) {
       return;
     }
     if (wallet.address !== deploymentPreview.ownerAddress) {
@@ -783,7 +787,7 @@ export default function App() {
             <p>
               <button
                 onClick={disconnectWallet}
-                disabled={walletBusy || signingBusy || genesisSigningBusy}
+                disabled={walletBusy || signingBusy || genesisSigningBusy || registrationSigningBusy}
               >
                 {walletBusy ? "Disconnecting..." : "Disconnect"}
               </button>
@@ -940,7 +944,7 @@ export default function App() {
               <p style={{ marginTop: 12 }}>
                 <button
                   onClick={signDeploymentPreview}
-                  disabled={!wallet || signingBusy || deploymentBusy || Boolean(signedTransaction)}
+                  disabled={!wallet || signingBusy || registrationSigningBusy || genesisSigningBusy || deploymentBusy || Boolean(signedTransaction)}
                 >
                   {signingBusy
                     ? "Waiting for JoyID..."
@@ -1072,6 +1076,7 @@ export default function App() {
               !stateArtifact ||
               genesisBusy ||
               genesisSigningBusy ||
+              registrationSigningBusy ||
               Boolean(genesisSignedTransaction) ||
               genesisSubmissionComplete ||
               genesisSubmissionOutcomeUncertain
@@ -1146,6 +1151,7 @@ export default function App() {
                     !genesisPreview ||
                     genesisBusy ||
                     genesisSigningBusy ||
+                    registrationSigningBusy ||
                     Boolean(genesisSignedTransaction)
                   }
                 >
@@ -1287,6 +1293,9 @@ export default function App() {
       </section>
 
       <RegistryRegistrationPanel
+        wallet={wallet}
+        otherSigningBusy={signingBusy || genesisSigningBusy}
+        onSigningBusyChange={setRegistrationSigningBusy}
         walletAddress={wallet?.address ?? null}
         registryArtifact={registryArtifact}
         stateArtifact={stateArtifact}
