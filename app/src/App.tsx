@@ -1,5 +1,6 @@
 
 import { useState } from "react";
+import { connectJoyIdTestnet, type WalletSession } from "./domain/wallet";
 import { ccc } from "@ckb-ccc/ccc";
 
 const TESTNET_ADDRESS =
@@ -19,6 +20,8 @@ export default function App() {
   const [status, setStatus] = useState("Ready");
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
+  const [wallet, setWallet] = useState<WalletSession | null>(null);
+  const [walletBusy, setWalletBusy] = useState(false);
 
   async function queryCells() {
     setLoading(true);
@@ -31,7 +34,7 @@ export default function App() {
     try {
       const client = owner.value;
       const address = await ccc.Address.fromString(
-        TESTNET_ADDRESS,
+        wallet?.address ?? TESTNET_ADDRESS,
         client,
       );
 
@@ -65,14 +68,72 @@ export default function App() {
     }
   }
 
+  async function connectWallet() {
+    setWalletBusy(true);
+    setError("");
+    setStatus("Connecting JoyID on CKB Testnet...");
+
+    try {
+      const session = await connectJoyIdTestnet();
+      setWallet(session);
+      setStatus("Wallet connected.");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+      setStatus("Wallet connection failed");
+    } finally {
+      setWalletBusy(false);
+    }
+  }
+
+  async function disconnectWallet() {
+    if (!wallet) {
+      return;
+    }
+
+    const session = wallet;
+    setWallet(null);
+    setWalletBusy(true);
+    setError("");
+
+    try {
+      await session.disconnect();
+      setStatus("Wallet disconnected.");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+      setStatus("Wallet disconnect failed");
+    } finally {
+      setWalletBusy(false);
+    }
+  }
   return (
     <main style={{ maxWidth: 1000, margin: "40px auto", padding: 24 }}>
       <h1>ReuseLoop</h1>
+      <section style={{ border: "1px solid #888", borderRadius: 8, padding: 16, marginBottom: 24 }}>
+        <h2>JoyID Wallet</h2>
+        <p>Network: CKB Testnet</p>
+        {wallet ? (
+          <>
+            <p><strong>Connected address:</strong></p>
+            <code style={{ overflowWrap: "anywhere" }}>{wallet.address}</code>
+            <p>
+              <button onClick={disconnectWallet} disabled={walletBusy}>
+                {walletBusy ? "Disconnecting..." : "Disconnect"}
+              </button>
+            </p>
+          </>
+        ) : (
+          <p>
+            <button onClick={connectWallet} disabled={walletBusy}>
+              {walletBusy ? "Connecting..." : "Connect JoyID"}
+            </button>
+          </p>
+        )}
+      </section>
       <h2>CKB Testnet - Cell Inspector</h2>
 
-      <p><strong>Address:</strong></p>
+      <p><strong>Inspector address:</strong></p>
       <code style={{ overflowWrap: "anywhere" }}>
-        {TESTNET_ADDRESS}
+        {wallet?.address ?? TESTNET_ADDRESS}
       </code>
 
       <p>
