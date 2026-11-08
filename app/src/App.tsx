@@ -1,6 +1,8 @@
 import { useState } from "react";
 import { ccc } from "@ckb-ccc/ccc";
 import RegistryRegistrationPanel from "./RegistryRegistrationPanel";
+import ItemLookupPanel from "./ItemLookupPanel";
+import ItemLifecyclePanel from "./ItemLifecyclePanel";
 import { connectJoyIdTestnet, type WalletSession } from "./domain/wallet";
 import {
   buildDeploymentPreview,
@@ -63,6 +65,7 @@ export default function App() {
   const [signedTransaction, setSignedTransaction] = useState<ccc.Transaction | null>(null);
   const [signingBusy, setSigningBusy] = useState(false);
   const [registrationSigningBusy, setRegistrationSigningBusy] = useState(false);
+  const [lifecycleBusy, setLifecycleBusy] = useState(false);
   const [signingError, setSigningError] = useState("");
   const [signingStatus, setSigningStatus] = useState("");
   const [confirmationBusy, setConfirmationBusy] = useState(false);
@@ -130,7 +133,7 @@ export default function App() {
   }
 
   async function disconnectWallet() {
-    if (!wallet || signingBusy || genesisSigningBusy || registrationSigningBusy) {
+    if (!wallet || signingBusy || genesisSigningBusy || registrationSigningBusy || lifecycleBusy) {
       return;
     }
 
@@ -166,7 +169,7 @@ export default function App() {
   ) {
     if (
       genesisSigningBusy ||
-      registrationSigningBusy ||
+      registrationSigningBusy || lifecycleBusy ||
       genesisSignedTransaction ||
       genesisSubmissionComplete ||
       genesisSubmissionOutcomeUncertain
@@ -255,7 +258,7 @@ export default function App() {
       !stateArtifact ||
       genesisBusy ||
       genesisSigningBusy ||
-      registrationSigningBusy ||
+      registrationSigningBusy || lifecycleBusy ||
       genesisSignedTransaction ||
       genesisSubmissionComplete ||
       genesisSubmissionOutcomeUncertain
@@ -300,7 +303,7 @@ export default function App() {
       !genesisPreview ||
       genesisSignedTransaction ||
       genesisSigningBusy ||
-      registrationSigningBusy ||
+      registrationSigningBusy || lifecycleBusy ||
       genesisBusy
     ) {
       return;
@@ -543,7 +546,7 @@ export default function App() {
     ? JSON.stringify(JSON.parse(ccc.stringify(deploymentPreview.transaction)), null, 2)
     : "";
   async function signDeploymentPreview() {
-    if (!wallet || !deploymentPreview || signedTransaction || signingBusy || registrationSigningBusy || genesisSigningBusy) {
+    if (!wallet || !deploymentPreview || signedTransaction || signingBusy || registrationSigningBusy || lifecycleBusy || genesisSigningBusy) {
       return;
     }
     if (wallet.address !== deploymentPreview.ownerAddress) {
@@ -787,7 +790,7 @@ export default function App() {
             <p>
               <button
                 onClick={disconnectWallet}
-                disabled={walletBusy || signingBusy || genesisSigningBusy || registrationSigningBusy}
+                disabled={walletBusy || signingBusy || genesisSigningBusy || registrationSigningBusy || lifecycleBusy}
               >
                 {walletBusy ? "Disconnecting..." : "Disconnect"}
               </button>
@@ -944,7 +947,7 @@ export default function App() {
               <p style={{ marginTop: 12 }}>
                 <button
                   onClick={signDeploymentPreview}
-                  disabled={!wallet || signingBusy || registrationSigningBusy || genesisSigningBusy || deploymentBusy || Boolean(signedTransaction)}
+                  disabled={!wallet || signingBusy || registrationSigningBusy || lifecycleBusy || genesisSigningBusy || deploymentBusy || Boolean(signedTransaction)}
                 >
                   {signingBusy
                     ? "Waiting for JoyID..."
@@ -1076,7 +1079,7 @@ export default function App() {
               !stateArtifact ||
               genesisBusy ||
               genesisSigningBusy ||
-              registrationSigningBusy ||
+              registrationSigningBusy || lifecycleBusy ||
               Boolean(genesisSignedTransaction) ||
               genesisSubmissionComplete ||
               genesisSubmissionOutcomeUncertain
@@ -1151,7 +1154,7 @@ export default function App() {
                     !genesisPreview ||
                     genesisBusy ||
                     genesisSigningBusy ||
-                    registrationSigningBusy ||
+                    registrationSigningBusy || lifecycleBusy ||
                     Boolean(genesisSignedTransaction)
                   }
                 >
@@ -1294,12 +1297,26 @@ export default function App() {
 
       <RegistryRegistrationPanel
         wallet={wallet}
-        otherSigningBusy={signingBusy || genesisSigningBusy}
+        otherSigningBusy={signingBusy || genesisSigningBusy || lifecycleBusy}
         onSigningBusyChange={setRegistrationSigningBusy}
         walletAddress={wallet?.address ?? null}
         registryArtifact={registryArtifact}
         stateArtifact={stateArtifact}
         registryGenesisTxHash={genesisPreview?.transaction.hash() ?? null}
+      />
+
+      <ItemLookupPanel
+        ownerAddress={wallet?.address ?? TESTNET_ADDRESS}
+        registryArtifact={registryArtifact}
+        stateArtifact={stateArtifact}
+      />
+
+      <ItemLifecyclePanel
+        wallet={wallet}
+        otherSigningBusy={signingBusy || genesisSigningBusy || registrationSigningBusy}
+        onBusyChange={setLifecycleBusy}
+        registryArtifact={registryArtifact}
+        stateArtifact={stateArtifact}
       />
 
       <h2>CKB Testnet - Cell Inspector</h2>
