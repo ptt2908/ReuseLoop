@@ -6,6 +6,7 @@ import {
 } from "./domain/registryRegistrationPreview";
 import type { VerifiedContractBinary } from "./domain/deploymentPreview";
 import type { WalletSession } from "./domain/wallet";
+import RegistrationSubmissionPanel from "./RegistrationSubmissionPanel";
 
 interface RegistryRegistrationPanelProps {
   wallet: WalletSession | null;
@@ -335,6 +336,14 @@ export default function RegistryRegistrationPanel({
             )}
           </section>
         </div>
+      )}
+      {signedTransaction && preview && (
+        <RegistrationSubmissionPanel
+          wallet={wallet}
+          preview={preview}
+          signedTransaction={signedTransaction}
+          onBusyChange={onSigningBusyChange}
+        />
       )}
     </section>
   );
