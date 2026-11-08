@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { ccc } from "@ckb-ccc/ccc";
+import RegistryRegistrationPanel from "./RegistryRegistrationPanel";
 import { connectJoyIdTestnet, type WalletSession } from "./domain/wallet";
 import {
   buildDeploymentPreview,
@@ -8,6 +9,10 @@ import {
   type DeploymentPreview,
   type VerifiedContractBinary,
 } from "./domain/deploymentPreview";
+import {
+  buildRegistryGenesisPreview,
+  type RegistryGenesisPreview,
+} from "./domain/registryGenesisPreview";
 
 const TESTNET_ADDRESS =
   "ckt1qrfrwcdnvssswdwpn3s9v8fp87emat306ctjwsm3nmlkjg8qyza2cqgqq8lu0rg7yvxngy0nwzqtvmzt2ygkgx09rqkk6css";
@@ -45,6 +50,16 @@ export default function App() {
     useState<DeploymentPreview | null>(null);
   const [deploymentBusy, setDeploymentBusy] = useState(false);
   const [deploymentError, setDeploymentError] = useState("");
+  const [genesisPreview, setGenesisPreview] =
+    useState<RegistryGenesisPreview | null>(null);
+  const [genesisBusy, setGenesisBusy] = useState(false);
+  const [genesisError, setGenesisError] = useState("");
+  const [genesisStatus, setGenesisStatus] = useState("");
+  const [genesisSignedTransaction, setGenesisSignedTransaction] =
+    useState<ccc.Transaction | null>(null);
+  const [genesisSigningBusy, setGenesisSigningBusy] = useState(false);
+  const [genesisSigningError, setGenesisSigningError] = useState("");
+  const [genesisSigningStatus, setGenesisSigningStatus] = useState("");
   const [signedTransaction, setSignedTransaction] = useState<ccc.Transaction | null>(null);
   const [signingBusy, setSigningBusy] = useState(false);
   const [signingError, setSigningError] = useState("");
@@ -114,13 +129,19 @@ export default function App() {
   }
 
   async function disconnectWallet() {
-    if (!wallet) {
+    if (!wallet || signingBusy || genesisSigningBusy) {
       return;
     }
 
     const session = wallet;
     setWallet(null);
     setDeploymentPreview(null);
+    setGenesisPreview(null);
+    setGenesisStatus("");
+    setGenesisError("");
+    setGenesisSignedTransaction(null);
+    setGenesisSigningStatus("");
+    setGenesisSigningError("");
     setSignedTransaction(null);
     setSigningStatus("");
     setSigningError("");
@@ -142,7 +163,21 @@ export default function App() {
     kind: ContractBinaryKind,
     file: File | undefined,
   ) {
+    if (
+      genesisSigningBusy ||
+      genesisSignedTransaction ||
+      genesisSubmissionComplete ||
+      genesisSubmissionOutcomeUncertain
+    ) {
+      return;
+    }
     setDeploymentPreview(null);
+    setGenesisPreview(null);
+    setGenesisStatus("");
+    setGenesisError("");
+    setGenesisSignedTransaction(null);
+    setGenesisSigningStatus("");
+    setGenesisSigningError("");
     setSignedTransaction(null);
     setSigningStatus("");
     setSigningError("");
@@ -208,6 +243,295 @@ export default function App() {
     } finally {
       await owner.dispose();
       setDeploymentBusy(false);
+    }
+  }
+
+  async function createRegistryGenesisPreview() {
+    if (
+      !wallet ||
+      !registryArtifact ||
+      !stateArtifact ||
+      genesisBusy ||
+      genesisSigningBusy ||
+      genesisSignedTransaction ||
+      genesisSubmissionComplete ||
+      genesisSubmissionOutcomeUncertain
+    ) {
+      return;
+    }
+
+    setGenesisBusy(true);
+    setGenesisError("");
+    setGenesisPreview(null);
+    setGenesisSignedTransaction(null);
+    setGenesisSigningStatus("");
+    setGenesisSigningError("");
+    setGenesisStatus("Building an unsigned Registry Genesis preview from live Testnet cells...");
+    const owner = ccc.ClientPublicTestnet.open();
+
+    try {
+      const preview = await buildRegistryGenesisPreview(
+        owner.value,
+        wallet.address,
+        registryArtifact,
+        stateArtifact,
+      );
+      setGenesisPreview(preview);
+      setGenesisStatus("Unsigned Registry Genesis preview is ready. It has not been signed or submitted.");
+    } catch (err) {
+      setGenesisError(err instanceof Error ? err.message : String(err));
+      setGenesisStatus("Could not build the Registry Genesis preview.");
+    } finally {
+      try {
+        await owner.dispose();
+      } catch {
+        // Client cleanup does not change the preview result.
+      }
+      setGenesisBusy(false);
+    }
+  }
+
+  async function signRegistryGenesisPreview() {
+    if (
+      !wallet ||
+      !genesisPreview ||
+      genesisSignedTransaction ||
+      genesisSigningBusy ||
+      genesisBusy
+    ) {
+      return;
+    }
+    if (wallet.address !== genesisPreview.ownerAddress) {
+      setGenesisSigningStatus("");
+      setGenesisSigningError(
+        "The connected wallet differs from the Registry Genesis preview owner. Rebuild the preview first.",
+      );
+      return;
+    }
+
+    setGenesisSigningBusy(true);
+    setGenesisSigningError("");
+    setGenesisSigningStatus("Review the Registry Genesis signing request in JoyID...");
+    const rawTransactionHash = genesisPreview.transaction.hash();
+
+    try {
+      const signed = await wallet.signTransaction(genesisPreview.transaction);
+      if (signed.hash().toLowerCase() !== rawTransactionHash.toLowerCase()) {
+        throw new Error(
+          "JoyID changed the Registry Genesis transaction fields. Do not use this signed result; rebuild and review a fresh preview.",
+        );
+      }
+      if (!signed.witnesses.some((witness) => String(witness).toLowerCase() !== "0x")) {
+        throw new Error("JoyID returned no signature witness for Registry Genesis.");
+      }
+
+      setGenesisSignedTransaction(signed);
+      setGenesisSigningStatus(
+        "JoyID signed the Registry Genesis transaction. It remains local and has not been submitted.",
+      );
+    } catch (err) {
+      setGenesisSigningStatus("");
+      setGenesisSigningError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setGenesisSigningBusy(false);
+    }
+  }
+
+  async function submitSignedRegistryGenesis() {
+    if (
+      !wallet ||
+      !genesisPreview ||
+      !genesisSignedTransaction ||
+      genesisBusy ||
+      genesisSigningBusy ||
+      genesisSubmissionInProgress ||
+      genesisSubmissionOutcomeUncertain ||
+      genesisSubmissionComplete
+    ) {
+      return;
+    }
+
+    if (wallet.address !== genesisPreview.ownerAddress) {
+      setGenesisSigningStatus("");
+      setGenesisSigningError(
+        "The connected wallet differs from the Registry Genesis preview owner. Rebuild and sign a fresh preview.",
+      );
+      return;
+    }
+
+    const expectedHash = genesisPreview.transaction.hash();
+    if (genesisSignedTransaction.hash().toLowerCase() !== expectedHash.toLowerCase()) {
+      setGenesisSigningStatus("");
+      setGenesisSigningError(
+        "The signed Registry Genesis transaction no longer matches the reviewed preview. Do not submit it.",
+      );
+      return;
+    }
+
+    if (
+      !genesisSignedTransaction.witnesses.some(
+        (witness) => String(witness).toLowerCase() !== "0x",
+      )
+    ) {
+      setGenesisSigningStatus("");
+      setGenesisSigningError(
+        "The signed Registry Genesis transaction has no signature witness. Sign the preview again before submitting.",
+      );
+      return;
+    }
+
+    setGenesisSigningError("");
+    const confirmed = window.confirm(
+      [
+        "Submit this signed Registry Genesis transaction to CKB Testnet?",
+        "This sends the transaction as reviewed and does not request another JoyID signature.",
+        "",
+        "Registry ID: " + genesisPreview.registryId,
+        "Registry Type Script hash: " + genesisPreview.registryTypeScriptHash,
+        "Seed input: " + genesisPreview.seedOutPoint,
+        "Seed capacity: " + formatCkb(genesisPreview.seedCapacity) + " CKB",
+        "Registry cell capacity: " + formatCkb(genesisPreview.registryCapacity) + " CKB",
+        "Estimated fee: " + formatCkb(genesisPreview.fee) + " CKB at " + genesisPreview.feeRate + " shannons/KB",
+        "Change: " + formatCkb(genesisPreview.change) + " CKB",
+        "Raw transaction hash: " + expectedHash,
+        "",
+        "Once accepted by a Testnet node, this transaction cannot be canceled.",
+        "Confirm the Registry ID and amounts before continuing.",
+      ].join("\n"),
+    );
+
+    if (!confirmed) {
+      setGenesisSigningStatus(
+        "Submission cancelled. The signed Registry Genesis transaction remains local.",
+      );
+      return;
+    }
+
+    setGenesisSigningBusy(true);
+    setGenesisSigningStatus("Submitting Registry Genesis to CKB Testnet...");
+    let clientOwner: ReturnType<typeof ccc.ClientPublicTestnet.open> | undefined;
+
+    try {
+      clientOwner = ccc.ClientPublicTestnet.open();
+      const returnedHash = String(
+        await clientOwner.value.sendTransaction(genesisSignedTransaction),
+      );
+
+      if (returnedHash.toLowerCase() !== expectedHash.toLowerCase()) {
+        setGenesisSigningStatus(
+          "Registry Genesis submission outcome uncertain. RPC returned " +
+            returnedHash +
+            " instead of " +
+            expectedHash +
+            ". Check both hashes before retrying.",
+        );
+        return;
+      }
+
+      setGenesisSigningStatus(
+        "Registry Genesis submitted to CKB Testnet; awaiting block confirmation. RPC transaction hash: " +
+          returnedHash,
+      );
+      try {
+        const confirmedTransaction = await clientOwner.value.waitTransaction(
+          returnedHash,
+          0,
+          120_000,
+          2_000,
+        );
+        if (confirmedTransaction?.blockNumber != null) {
+          setGenesisSigningStatus(
+            "Registry Genesis confirmed on CKB Testnet in block " +
+              String(confirmedTransaction.blockNumber) +
+              ". RPC transaction hash: " +
+              returnedHash,
+          );
+        } else {
+          setGenesisSigningStatus(
+            "Registry Genesis submitted to CKB Testnet, but confirmation is not available yet. Check transaction hash " +
+              returnedHash +
+              " before retrying.",
+          );
+        }
+      } catch {
+        setGenesisSigningStatus(
+          "Registry Genesis submitted to CKB Testnet, but confirmation could not be verified yet. Check transaction hash " +
+            returnedHash +
+            " before retrying.",
+        );
+      }
+    } catch (err) {
+      setGenesisSigningStatus(
+        "Registry Genesis submission outcome uncertain. Check transaction hash " +
+          expectedHash +
+          " before retrying.",
+      );
+      setGenesisSigningError(err instanceof Error ? err.message : String(err));
+    } finally {
+      if (clientOwner) {
+        try {
+          await clientOwner.dispose();
+        } catch {
+          // Cleanup errors do not change the node's submission result.
+        }
+      }
+      setGenesisSigningBusy(false);
+    }
+  }
+
+  async function checkRegistryGenesisConfirmation() {
+    if (
+      !genesisSignedTransaction ||
+      !genesisSubmissionComplete ||
+      genesisSubmissionConfirmed ||
+      genesisSigningBusy
+    ) {
+      return;
+    }
+
+    const txHash = genesisSignedTransaction.hash();
+    let clientOwner: ReturnType<typeof ccc.ClientPublicTestnet.open> | undefined;
+    setGenesisSigningBusy(true);
+    setGenesisSigningError("");
+    setGenesisSigningStatus("Checking Registry Genesis block confirmation...");
+
+    try {
+      clientOwner = ccc.ClientPublicTestnet.open();
+      const confirmedTransaction = await clientOwner.value.waitTransaction(
+        txHash,
+        0,
+        120_000,
+        2_000,
+      );
+      if (confirmedTransaction?.blockNumber != null) {
+        setGenesisSigningStatus(
+          "Registry Genesis confirmed on CKB Testnet in block " +
+            String(confirmedTransaction.blockNumber) +
+            ". RPC transaction hash: " +
+            txHash,
+        );
+      } else {
+        setGenesisSigningStatus(
+          "Registry Genesis submitted to CKB Testnet, but confirmation is not available yet. Check transaction hash " +
+            txHash +
+            " before retrying.",
+        );
+      }
+    } catch {
+      setGenesisSigningStatus(
+        "Registry Genesis submitted to CKB Testnet, but confirmation could not be verified yet. Check transaction hash " +
+          txHash +
+          " before retrying.",
+      );
+    } finally {
+      setGenesisSigningBusy(false);
+      if (clientOwner) {
+        try {
+          await clientOwner.dispose();
+        } catch {
+          // Cleanup errors do not change the confirmation result.
+        }
+      }
     }
   }
 
@@ -434,6 +758,17 @@ export default function App() {
   const submissionConfirmed = signingStatus.startsWith("Confirmed on CKB Testnet in block");
   const submissionComplete =
     signingStatus.startsWith("Submitted to CKB Testnet") || submissionConfirmed;
+  const genesisSubmissionInProgress =
+    genesisSigningStatus.startsWith("Submitting Registry Genesis to CKB Testnet") ||
+    genesisSigningStatus.startsWith("Checking Registry Genesis block confirmation") ||
+    genesisSigningStatus.startsWith("Registry Genesis submitted to CKB Testnet; awaiting block confirmation");
+  const genesisSubmissionOutcomeUncertain =
+    genesisSigningStatus.startsWith("Registry Genesis submission outcome uncertain");
+  const genesisSubmissionConfirmed =
+    genesisSigningStatus.startsWith("Registry Genesis confirmed on CKB Testnet in block");
+  const genesisSubmissionComplete =
+    genesisSigningStatus.startsWith("Registry Genesis submitted to CKB Testnet") ||
+    genesisSubmissionConfirmed;
 
   return (
     <main style={{ maxWidth: 1000, margin: "40px auto", padding: 24 }}>
@@ -446,7 +781,10 @@ export default function App() {
             <p><strong>Connected address:</strong></p>
             <code style={{ overflowWrap: "anywhere" }}>{wallet.address}</code>
             <p>
-              <button onClick={disconnectWallet} disabled={walletBusy}>
+              <button
+                onClick={disconnectWallet}
+                disabled={walletBusy || signingBusy || genesisSigningBusy}
+              >
                 {walletBusy ? "Disconnecting..." : "Disconnect"}
               </button>
             </p>
@@ -594,16 +932,21 @@ export default function App() {
               </pre>
             </details>
             <section style={{ border: "1px solid #888", borderRadius: 8, padding: 16, marginTop: 20 }}>
-              <h4>Checkpoint 3 — Sign</h4>
+              <h4>CP11.3 — Sign contract code deployment</h4>
               <p>
-                This asks JoyID to sign the exact reviewed transaction. Signing keeps the transaction local.
+                This signs only the code-cell deployment preview above, not Registry Genesis. Use it only if you
+                intend to create another contract code deployment. The signature remains local.
               </p>
               <p style={{ marginTop: 12 }}>
                 <button
                   onClick={signDeploymentPreview}
                   disabled={!wallet || signingBusy || deploymentBusy || Boolean(signedTransaction)}
                 >
-                  {signingBusy ? "Waiting for JoyID..." : signedTransaction ? "Signed locally" : "Sign this preview in JoyID"}
+                  {signingBusy
+                    ? "Waiting for JoyID..."
+                    : signedTransaction
+                      ? "Code deployment signed locally"
+                      : "Sign code deployment preview in JoyID"}
                 </button>
               </p>
               {signingStatus && !signedTransaction && <p style={{ marginTop: 8 }}>{signingStatus}</p>}
@@ -646,7 +989,7 @@ export default function App() {
               )}
             </section>
             <section style={{ border: "1px solid #888", borderRadius: 8, padding: 16, marginTop: 16 }}>
-              <h4>Checkpoint 4 — Submit to Testnet</h4>
+              <h4>CP11.3 — Submit contract code deployment</h4>
               <p>
                 This sends the already-signed transaction through the CKB Testnet client. It will not request another JoyID signature.
               </p>
@@ -713,6 +1056,242 @@ export default function App() {
           </div>
         )}
       </section>
+
+      <section style={{ border: "1px solid #888", borderRadius: 8, padding: 16, marginBottom: 24 }}>
+        <h2>CP11.4.1 — Registry Genesis Preview</h2>
+        <p>
+          Build the first Registry cell from the deployed Registry code cell and a live empty wallet cell.
+          This step only reads Testnet data and creates an unsigned preview.
+        </p>
+        <p style={{ marginTop: 12 }}>
+          <button
+            onClick={createRegistryGenesisPreview}
+            disabled={
+              !wallet ||
+              !registryArtifact ||
+              !stateArtifact ||
+              genesisBusy ||
+              genesisSigningBusy ||
+              Boolean(genesisSignedTransaction) ||
+              genesisSubmissionComplete ||
+              genesisSubmissionOutcomeUncertain
+            }
+          >
+            {genesisBusy ? "Building Registry preview..." : "Build unsigned Registry Genesis preview"}
+          </button>
+        </p>
+        {!wallet && <p>Connect JoyID on CKB Testnet first.</p>}
+        {wallet && (!registryArtifact || !stateArtifact) && (
+          <p>Verify both CP11.1 contract binaries in Checkpoint 2 first.</p>
+        )}
+        {genesisStatus && <p style={{ marginTop: 8 }}>{genesisStatus}</p>}
+        {genesisError && (
+          <pre style={{ whiteSpace: "pre-wrap", color: "crimson", overflowWrap: "anywhere" }}>
+            {genesisError}
+          </pre>
+        )}
+        {genesisPreview && (
+          <div style={{ marginTop: 16, textAlign: "left" }}>
+            <p><strong>Network:</strong> CKB Testnet</p>
+            <p><strong>Registry ID:</strong></p>
+            <code style={{ overflowWrap: "anywhere" }}>{genesisPreview.registryId}</code>
+            <p style={{ marginTop: 8 }}><strong>Registry Type Script hash:</strong></p>
+            <code style={{ overflowWrap: "anywhere" }}>{genesisPreview.registryTypeScriptHash}</code>
+            <p style={{ marginTop: 8 }}>
+              <strong>Registry cell capacity:</strong> {formatCkb(genesisPreview.registryCapacity)} CKB
+            </p>
+            <p style={{ marginTop: 8 }}><strong>Seed input:</strong></p>
+            <code style={{ overflowWrap: "anywhere" }}>{genesisPreview.seedOutPoint}</code>
+            <p>Seed capacity: {formatCkb(genesisPreview.seedCapacity)} CKB</p>
+            <p style={{ marginTop: 8 }}><strong>Registry code cell dependency:</strong></p>
+            <code style={{ overflowWrap: "anywhere" }}>{genesisPreview.registryCodeOutPoint}</code>
+            <p style={{ marginTop: 8 }}><strong>State binary cell verified:</strong></p>
+            <code style={{ overflowWrap: "anywhere" }}>{genesisPreview.stateCodeOutPoint}</code>
+            <p style={{ marginTop: 8 }}>
+              <strong>Estimated fee:</strong> {formatCkb(genesisPreview.fee)} CKB
+              ({genesisPreview.fee} shannons) at {genesisPreview.feeRate} shannons/KB
+            </p>
+            <p><strong>Change:</strong> {formatCkb(genesisPreview.change)} CKB</p>
+            <p><strong>Unsigned transaction hash:</strong></p>
+            <code style={{ overflowWrap: "anywhere" }}>{genesisPreview.transaction.hash()}</code>
+            <details style={{ marginTop: 16 }}>
+              <summary>Raw unsigned Registry Genesis transaction JSON</summary>
+              <pre
+                style={{
+                  whiteSpace: "pre-wrap",
+                  overflowWrap: "anywhere",
+                  maxHeight: 420,
+                  overflow: "auto",
+                  fontSize: 12,
+                }}
+              >
+                {JSON.stringify(
+                  JSON.parse(ccc.stringify(genesisPreview.transaction)),
+                  null,
+                  2,
+                )}
+              </pre>
+            </details>
+            <section style={{ border: "1px solid #888", borderRadius: 8, padding: 16, marginTop: 20 }}>
+              <h3>CP11.4.2 — Sign Registry Genesis</h3>
+              <p>
+                This asks JoyID to sign the Registry Genesis preview above. The signature remains local;
+                this action does not submit or broadcast the transaction.
+              </p>
+              <p style={{ marginTop: 12 }}>
+                <button
+                  onClick={signRegistryGenesisPreview}
+                  disabled={
+                    !wallet ||
+                    !genesisPreview ||
+                    genesisBusy ||
+                    genesisSigningBusy ||
+                    Boolean(genesisSignedTransaction)
+                  }
+                >
+                  {genesisSigningBusy
+                    ? genesisSubmissionInProgress
+                      ? "Submitting or checking confirmation..."
+                      : "Waiting for JoyID..."
+                    : genesisSignedTransaction
+                      ? "Registry Genesis signed locally"
+                      : "Sign Registry Genesis in JoyID"}
+                </button>
+              </p>
+              {genesisSigningStatus && !genesisSignedTransaction && (
+                <p style={{ marginTop: 8 }}>{genesisSigningStatus}</p>
+              )}
+              {genesisSigningError && (
+                <pre style={{ whiteSpace: "pre-wrap", color: "crimson", overflowWrap: "anywhere" }}>
+                  {genesisSigningError}
+                </pre>
+              )}
+              {genesisSignedTransaction && (
+                <section style={{ border: "1px solid #aaa", borderRadius: 8, padding: 12, marginTop: 12 }}>
+                  <h4>
+                    {genesisSubmissionConfirmed
+                      ? "Registry Genesis confirmed"
+                      : genesisSubmissionComplete
+                        ? "Registry Genesis submitted"
+                        : genesisSubmissionOutcomeUncertain
+                          ? "Registry Genesis submission status uncertain"
+                          : "Signed Registry Genesis — not submitted"}
+                  </h4>
+                  <p>Raw transaction hash (must match the reviewed preview):</p>
+                  <code style={{ overflowWrap: "anywhere" }}>{genesisSignedTransaction.hash()}</code>
+                  <p style={{ marginTop: 8 }}>Full transaction hash including witnesses:</p>
+                  <code style={{ overflowWrap: "anywhere" }}>{genesisSignedTransaction.hashFull()}</code>
+                  <p style={{ marginTop: 8 }}>
+                    Witnesses: {genesisSignedTransaction.witnesses.length}; signature present.
+                  </p>
+                  <details style={{ marginTop: 12 }}>
+                    <summary>Signed Registry Genesis transaction JSON</summary>
+                    <pre
+                      style={{
+                        whiteSpace: "pre-wrap",
+                        overflowWrap: "anywhere",
+                        maxHeight: 420,
+                        overflow: "auto",
+                        fontSize: 12,
+                      }}
+                    >
+                      {JSON.stringify(
+                        JSON.parse(ccc.stringify(genesisSignedTransaction)),
+                        null,
+                        2,
+                      )}
+                    </pre>
+                  </details>
+                </section>
+              )}
+            </section>
+            <section style={{ border: "1px solid #888", borderRadius: 8, padding: 16, marginTop: 16 }}>
+              <h4>CP11.4.3 — Submit Registry Genesis</h4>
+              <p>
+                This broadcasts the already-signed Registry Genesis transaction to CKB Testnet.
+                It does not request another signature. Review the summary and final browser confirmation first.
+              </p>
+              {genesisSignedTransaction ? (
+                <>
+                  <p><strong>Network:</strong> CKB Testnet</p>
+                  <p><strong>Registry ID:</strong></p>
+                  <code style={{ overflowWrap: "anywhere" }}>{genesisPreview.registryId}</code>
+                  <p style={{ marginTop: 8 }}>
+                    <strong>Registry cell:</strong> {formatCkb(genesisPreview.registryCapacity)} CKB
+                  </p>
+                  <p><strong>Seed input:</strong></p>
+                  <code style={{ overflowWrap: "anywhere" }}>{genesisPreview.seedOutPoint}</code>
+                  <p style={{ marginTop: 8 }}>
+                    <strong>Estimated fee:</strong> {formatCkb(genesisPreview.fee)} CKB
+                    ({genesisPreview.fee} shannons) at {genesisPreview.feeRate} shannons/KB
+                  </p>
+                  <p><strong>Change:</strong> {formatCkb(genesisPreview.change)} CKB</p>
+                  <p><strong>Raw transaction hash:</strong></p>
+                  <code style={{ overflowWrap: "anywhere" }}>{genesisSignedTransaction.hash()}</code>
+                  <p style={{ marginTop: 12 }}>
+                    Once a Testnet node accepts this transaction, its seed input is consumed and the Registry cell is created.
+                    Do not retry if the submission result is uncertain; check the hash with an explorer first.
+                  </p>
+                  <button
+                    onClick={submitSignedRegistryGenesis}
+                    disabled={
+                      !wallet ||
+                      genesisSigningBusy ||
+                      genesisSubmissionInProgress ||
+                      genesisSubmissionOutcomeUncertain ||
+                      genesisSubmissionComplete
+                    }
+                  >
+                    {genesisSubmissionConfirmed
+                      ? "Registry Genesis confirmed"
+                      : genesisSubmissionInProgress
+                        ? "Submitting or checking confirmation..."
+                        : genesisSubmissionComplete
+                          ? "Submitted; check block status"
+                          : genesisSubmissionOutcomeUncertain
+                            ? "Check transaction status before retrying"
+                            : "Submit signed Registry Genesis to Testnet"}
+                  </button>
+                  {genesisSigningStatus && (
+                    <p style={{ marginTop: 8 }}>{genesisSigningStatus}</p>
+                  )}
+                  {genesisSigningError && (
+                    <pre style={{ whiteSpace: "pre-wrap", color: "crimson", overflowWrap: "anywhere" }}>
+                      {genesisSigningError}
+                    </pre>
+                  )}
+                  {genesisSubmissionComplete && !genesisSubmissionConfirmed && (
+                    <p style={{ marginTop: 8 }}>
+                      <button
+                        onClick={checkRegistryGenesisConfirmation}
+                        disabled={genesisSigningBusy}
+                      >
+                        {genesisSigningBusy
+                          ? "Checking block confirmation..."
+                          : "Check Registry Genesis block confirmation"}
+                      </button>
+                    </p>
+                  )}
+                  {genesisSubmissionOutcomeUncertain && (
+                    <p>
+                      Do not submit again until you check the transaction hash with a Testnet explorer or RPC.
+                    </p>
+                  )}
+                </>
+              ) : (
+                <p>Sign the reviewed Registry Genesis transaction above to enable submission.</p>
+              )}
+            </section>
+          </div>
+        )}
+      </section>
+
+      <RegistryRegistrationPanel
+        walletAddress={wallet?.address ?? null}
+        registryArtifact={registryArtifact}
+        stateArtifact={stateArtifact}
+        registryGenesisTxHash={genesisPreview?.transaction.hash() ?? null}
+      />
 
       <h2>CKB Testnet - Cell Inspector</h2>
       <p><strong>Inspector address:</strong></p>
