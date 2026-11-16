@@ -1,75 +1,29 @@
-# React + TypeScript + Vite
+# ReuseLoop App
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+This directory contains the React, TypeScript, and Vite client. It connects directly to CKB Testnet through CCC; there is no application server.
 
-Currently, two official plugins are available:
+For prerequisites, verified contract artifacts, wallet setup, and the end-to-end demo, see the repository [developer setup](../docs/developer-setup.md), [Week 12 demo guide](../docs/week12-demo.md), and [README](../README.md).
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+## Start locally
 
-## React Compiler
-
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
-
-## Expanding the ESLint configuration
-
-If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
-
-```js
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-
-      // Remove tseslint.configs.recommended and replace with this
-      tseslint.configs.recommendedTypeChecked,
-      // Alternatively, use this for stricter rules
-      tseslint.configs.strictTypeChecked,
-      // Optionally, add this for stylistic rules
-      tseslint.configs.stylisticTypeChecked,
-
-      // Other configs...
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
-
+```powershell
+npm ci
+npm run dev
 ```
 
-You can also install [eslint-plugin-react-x](https://npmx.dev/package/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://npmx.dev/package/eslint-plugin-react-dom) for React-specific lint rules:
+## Available scripts
 
-```js
-// eslint.config.js
-import reactX from 'eslint-plugin-react-x'
-import reactDom from 'eslint-plugin-react-dom'
-
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-      // Enable lint rules for React
-      reactX.configs['recommended-typescript'],
-      // Enable lint rules for React DOM
-      reactDom.configs.recommended,
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
-
+```powershell
+npm test
+npm run build
+npm run lint
 ```
+
+The Week 12 record reports 62 passing app tests and a successful build. The build still emits Vite's large-chunk warning; lint is available but was not recorded as run for Week 12.
+
+## CKB Testnet notes
+
+- Select both verified Registry and State binaries in **Admin / Registry setup**. The UI checks the pinned SHA-256 values.
+- Artifact selection is held in the current page session and must be repeated after reload.
+- A URL `?item=<32-byte-id>` pre-fills the lookup field; click **Look up item** to query current cells and history.
+- The app currently uses the public CKB Testnet and JoyID CKB signer path. It does not verify physical-world activity.

@@ -3,6 +3,14 @@ import { ccc } from "@ckb-ccc/ccc";
 import type { VerifiedContractBinary } from "./domain/deploymentPreview";
 import type { WalletSession } from "./domain/wallet";
 import { buildLifecyclePreview, type LifecyclePreview } from "./domain/lifecyclePreview";
+import {
+  canStartSubmission,
+  classifySubmissionFailure,
+  findFirstUnavailableInput,
+  observeTransactionConfirmation,
+  transactionHashesMatch,
+  type SubmissionState,
+} from "./domain/submissionSafety";
 
 interface ItemLifecyclePanelProps {
   wallet: WalletSession | null;
@@ -12,7 +20,7 @@ interface ItemLifecyclePanelProps {
   stateArtifact: VerifiedContractBinary | null;
 }
 
-type SubmissionState = "ready" | "submitting" | "submitted" | "confirmed" | "uncertain";
+
 
 function formatCkb(shannons: string): string {
   const value = BigInt(shannons);
@@ -148,7 +156,7 @@ export default function ItemLifecyclePanel({
     if (wallet.address !== preview.ownerAddress) {
       return "The connected wallet differs from this lifecycle preview owner.";
     }
-    if (signedTransaction.hash().toLowerCase() !== preview.transaction.hash().toLowerCase()) {
+    if (!transactionHashesMatch(signedTransaction.hash(), preview.transaction.hash())) {
       return "The signed transaction no longer matches the reviewed preview.";
     }
     if (!signedTransaction.witnesses.some((witness) => String(witness).toLowerCase() !== "0x")) {
@@ -158,7 +166,7 @@ export default function ItemLifecyclePanel({
   }
 
   async function submitSignedTransaction() {
-    if (submissionState !== "ready" || busy || !preview || !signedTransaction) {
+    if (!canStartSubmission(submissionState, busy) || !preview || !signedTransaction) {
       return;
     }
     const validationError = validateSignedTransaction();
@@ -202,20 +210,22 @@ export default function ItemLifecyclePanel({
 
     try {
       clientOwner = ccc.ClientPublicTestnet.open();
-      for (const input of signedTransaction.inputs) {
-        const liveInput = await clientOwner.value.getCellLive(input.previousOutput, true);
-        if (!liveInput) {
-          setSubmissionState("ready");
-          setStatus("A transaction input is no longer live. Nothing was submitted; rebuild the preview from current Testnet cells.");
-          setError("At least one input was consumed or is not available from the Testnet indexer.");
-          return;
-        }
+      const unavailableInput = await findFirstUnavailableInput(
+        signedTransaction.inputs,
+        async (input) => Boolean(await clientOwner!.value.getCellLive(input.previousOutput, true)),
+      );
+      if (unavailableInput) {
+        setSignedTransaction(null);
+        setSubmissionState("ready");
+        setStatus("A transaction input is no longer live. Nothing was submitted; the local signature was cleared. Rebuild and review the preview.");
+        setError("At least one input was consumed or is not available from the Testnet indexer.");
+        return;
       }
 
       setStatus("Submitting the signed lifecycle transaction to CKB Testnet...");
       sendStarted = true;
       const returnedHash = String(await clientOwner.value.sendTransaction(signedTransaction));
-      if (returnedHash.toLowerCase() !== expectedHash.toLowerCase()) {
+      if (!transactionHashesMatch(expectedHash, returnedHash)) {
         setSubmissionState("uncertain");
         setStatus("Submission outcome uncertain: RPC returned a different transaction hash. Check both hashes before any retry.");
         setError("Expected " + expectedHash + " but the RPC returned " + returnedHash + ".");
@@ -225,29 +235,24 @@ export default function ItemLifecyclePanel({
       setSubmittedHash(returnedHash);
       setSubmissionState("submitted");
       setStatus("Lifecycle transaction submitted. Waiting for block confirmation; do not submit it again.");
-      try {
-        const confirmedTransaction = await clientOwner.value.waitTransaction(
-          returnedHash,
-          0,
-          120_000,
-          2_000,
+      const confirmation = await observeTransactionConfirmation(() =>
+        clientOwner!.value.waitTransaction(returnedHash, 0, 120_000, 2_000),
+      );
+      if (confirmation.kind === "confirmed") {
+        setSubmissionState("confirmed");
+        setStatus(
+          preview.action + " confirmed on CKB Testnet in block " +
+            confirmation.blockNumber +
+            ". Transaction hash: " +
+            returnedHash,
         );
-        if (confirmedTransaction?.blockNumber != null) {
-          setSubmissionState("confirmed");
-          setStatus(
-            preview.action + " confirmed on CKB Testnet in block " +
-              String(confirmedTransaction.blockNumber) +
-              ". Transaction hash: " +
-              returnedHash,
-          );
-        } else {
-          setStatus("Submitted, but block confirmation is not available yet. Check the transaction hash before taking further action.");
-        }
-      } catch {
+      } else if (confirmation.kind === "pending") {
+        setStatus("Submitted, but block confirmation is not available yet. Check the transaction hash before taking further action.");
+      } else {
         setStatus("Submitted, but block confirmation could not be checked yet. Check the transaction hash; do not resubmit.");
       }
     } catch (err) {
-      if (sendStarted) {
+      if (classifySubmissionFailure(sendStarted) === "uncertain") {
         setSubmissionState("uncertain");
         setStatus("Submission outcome uncertain. Check the expected transaction hash with a Testnet explorer before any retry.");
       } else {
@@ -279,22 +284,22 @@ export default function ItemLifecyclePanel({
     let clientOwner: ReturnType<typeof ccc.ClientPublicTestnet.open> | undefined;
     try {
       clientOwner = ccc.ClientPublicTestnet.open();
-      const confirmedTransaction = await clientOwner.value.waitTransaction(
-        submittedHash,
-        0,
-        120_000,
-        2_000,
+      const confirmation = await observeTransactionConfirmation(() =>
+        clientOwner!.value.waitTransaction(submittedHash, 0, 120_000, 2_000),
       );
-      if (confirmedTransaction?.blockNumber != null) {
+      if (confirmation.kind === "confirmed") {
         setSubmissionState("confirmed");
         setStatus(
           preview?.action + " confirmed on CKB Testnet in block " +
-            String(confirmedTransaction.blockNumber) +
+            confirmation.blockNumber +
             ". Transaction hash: " +
             submittedHash,
         );
-      } else {
+      } else if (confirmation.kind === "pending") {
         setStatus("Block confirmation is not available yet. Do not resubmit.");
+      } else {
+        setStatus("Block confirmation could not be checked. Do not resubmit; check the transaction hash with a Testnet explorer.");
+        setError(confirmation.error instanceof Error ? confirmation.error.message : String(confirmation.error));
       }
     } catch (err) {
       setStatus("Block confirmation could not be checked. Do not resubmit; check the transaction hash with a Testnet explorer.");
@@ -342,7 +347,7 @@ export default function ItemLifecyclePanel({
   const canSubmit = Boolean(
     preview &&
     signedTransaction &&
-    submissionState === "ready" &&
+    canStartSubmission(submissionState, busy) &&
     !busy &&
     wallet?.address === preview.ownerAddress,
   );

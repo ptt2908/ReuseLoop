@@ -196,3 +196,27 @@ The ReuseLoop architecture strictly separates script responsibilities:
 - Spore or DOB protocol integration.
 - Fiber network payments or deposit handling.
 - Physical IoT automated sensor verification.
+
+## 9. Week 12 Runtime and Operational Notes
+
+### Administrator authorization in the running app
+
+The MVP has one administrator lock for the canonical Registry and its State Cells. Registry Genesis, item registration, Borrow, Confirm Return, and Make Available all require inputs that satisfy the same configured `admin_lock_hash`. The current frontend supports a JoyID CKB Testnet signer for this administrator workflow; it does not implement borrower keys, per-store keys, multisignature, or role-specific permissions.
+
+The frontend checks that the connected address matches the preview owner before signing/submitting. That is a user-facing safety check, not the security boundary. The CKB Lock Script validates the signature; the Registry and State Type Scripts enforce lock identity and transaction invariants. The frontend never receives a private key or recovery phrase. The MVP has no separate administrator key rotation or recovery workflow.
+
+### Lookup, indexer, and refresh behavior
+
+The client connects through CCC's public CKB Testnet client. Lookup is manually started with **Look up item**. A `?item=` URL parameter fills the Item ID field but does not run a query. The lookup checks the wallet's indexed cells, rechecks candidate cells for liveness, and validates the canonical Registry and State relationships. It scans at most 500 owner cells; history loads at most 20 recent State transactions and then fetches transaction details from RPC.
+
+After a lifecycle transaction is confirmed, the item card and history are not automatically reloaded; click **Look up item** again. If RPC or indexer data is delayed, the UI can remain busy, return an unavailable result, or show history errors until a later read succeeds. A submitted transaction with unavailable confirmation is an uncertain result: keep its hash and inspect that hash before considering another submission.
+
+Verified Registry and State files are required by lookup and lifecycle preview. The user-selected `File` contents are held in page state and are lost on reload; select and verify both again. The SHA-256 values are pinned in `app/src/domain/deploymentPreview.ts`; see [developer-setup.md](developer-setup.md) for the current file paths and build procedure.
+
+### Operational boundaries
+
+- Testnet records prove that an authorized transaction was committed under the script rules. They do not prove physical handoff, return, cleaning, inspection, custody, or condition.
+- The current app is a single-administrator prototype. Compromise, loss, or unavailability of that administrator is not addressed by a multi-party recovery design.
+- Testnet RPC and indexer availability are runtime dependencies; the lookup result is not a background subscription.
+- The Week 12 frontend production build succeeds but Vite reports an existing JavaScript chunk larger than 500 kB after minification. Code splitting or lazy loading remains future work.
+- The Cell Inspector displays raw cell Data; the user-requested per-cell expand/collapse control remains deferred.
