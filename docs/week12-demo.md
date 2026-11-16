@@ -29,7 +29,7 @@ Open the local URL printed by Vite (normally `http://localhost:5173`). If the ap
 ## Walkthrough
 
 1. Confirm the app shows `CKB Testnet` and the connected JoyID address.
-2. Explain Registry Genesis as the one-time initialization that created the existing Registry. In this live instance, verify the current Registry ID (`0x3b1f5c7ca40ccb35c054e850185398cb2b07b0b7bbfbf1eed4ee1d6265790b60`) and item count (`2`) in the lookup result. Do not build or submit Genesis again. The current evidence captures the live Registry and its canonical cell, but not a verified Genesis transaction hash; this guide intentionally does not guess one.
+2. Explain Registry Genesis as the one-time initialization that created the existing Registry. In this live instance, verify the current Registry ID (`0x3b1f5c7ca40ccb35c054e850185398cb2b07b0b7bbfbf1eed4ee1d6265790b60`) and item count (`2`) in the lookup result. Do not build or submit Genesis again. The Registry Genesis transaction is recorded in the [Week 11 report](D:/CKB_prj/ckbuilder/ckb_weekly_report_w11.md) as committed in block `22,998,717`: [0x5ba65a14e5f393589812f2ed5dfb00db68d12dbc8498d5fcf66c98493809bd6f](https://pudge.explorer.nervos.org/transaction/0x5ba65a14e5f393589812f2ed5dfb00db68d12dbc8498d5fcf66c98493809bd6f). The live lookup separately confirms the current Registry ID and canonical cell.
 3. In **CP11.6 — Item Lookup and Status**, look up item ID `0x9f2e2c5938cb346f0d23e112bdf763ff21293285c98967afd181c261f09948c2`.
 4. Confirm the displayed status is `AVAILABLE`, and show the live State cell and canonical Registry cell. A successful result means the app found current live Testnet cells; it is not proof of a physical handoff. The URL query parameter only pre-fills the Item ID; click **Look up item** to fetch current data.
 5. Scroll to **Recent on-chain history** and review the confirmed lifecycle in order:
@@ -71,7 +71,5 @@ The contract suite covers successful lifecycle execution and rejects invalid tra
 
 ## Earlier deployment reference
 
-The CP11.3 contract deployment was previously verified as committed in block `23084185`: [0xdc8890aa1b904b3037095825e02982e7dc4a5aae25fbbc06cc348945f6aced9c](https://pudge.explorer.nervos.org/transaction/0xdc8890aa1b904b3037095825e02982e7dc4a5aae25fbbc06cc348945f6aced9c). This is separate from Registry Genesis; the Genesis transaction hash is not asserted in this guide.
-
-
+The CP11.3 contract deployment was previously verified as committed in block `23084185`: [0xdc8890aa1b904b3037095825e02982e7dc4a5aae25fbbc06cc348945f6aced9c](https://pudge.explorer.nervos.org/transaction/0xdc8890aa1b904b3037095825e02982e7dc4a5aae25fbbc06cc348945f6aced9c). This deployment reference is separate from Registry Genesis. The Genesis transaction is documented in the Week 11 report and Step 2 above.
 

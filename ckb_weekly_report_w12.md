@@ -1,75 +1,164 @@
-# CKB Weekly Report — Week 12
+# Week 12 Report - ReuseLoop UI Hardening, Verification, and Demo Readiness
+**Reporting period:** 9 Nov - 15 Nov 2026 (final closeout: 17 Nov 2026)
+**Participant:** Pham Tan Thinh
+**Program:** CKB Builder Track
 
-Reporting date: 2026-11-17 (Asia/Bangkok)
-Repository: `D:\CKB_prj\ReuseLoop`
+## 1. Courses and Topics Completed
 
-## Summary
+During Week 12, I focused on improving the ReuseLoop demo workflow, hardening transaction submission feedback, verifying the app and contract suites, and preparing setup and peer-review documentation.
 
-CP12.1 through CP12.4 are complete. The Week 12 work reorganized the primary item workflow, added and verified submission-safety handling, prepared a read-only Testnet demo, and updated developer/setup/architecture documentation. The app and contract suites passed at CP12.2. CP12.4 changed documentation only; it did not change contract or frontend code and did not rerun tests.
+The main topics covered were:
 
-No new Testnet transaction was submitted during Week 12. The demo uses the existing confirmed Week 11 deployment and lifecycle. Optional CP12.5 (Fiber feasibility) remains deferred because the current MVP has no recorded payment/settlement use case or funded Testnet plan.
+- **Primary Workflow and Interface Structure**
+  - Moving item lookup and lifecycle actions ahead of Admin and Diagnostics sections.
+  - Keeping transaction preview, wallet signing, submission, and confirmation as separate steps.
+  - Making pending, confirmed, and uncertain transaction outcomes distinguishable.
+- **Submission Safety and Error Handling**
+  - Preventing duplicate submission attempts while an operation is active.
+  - Checking transaction inputs before broadcast and clearing a signature if an input is stale.
+  - Distinguishing failures before broadcast from uncertain outcomes after broadcast.
+- **Verification and Testnet Evidence**
+  - Adding focused app tests for submission and confirmation behavior.
+  - Reusing confirmed Week 11 Testnet transactions rather than creating duplicate transactions.
+  - Capturing the current AVAILABLE lookup and lifecycle history.
+- **Developer Setup and Project Limitations**
+  - Documenting pinned contract artifact hashes, setup steps, and refresh behavior.
+  - Clarifying the single-administrator authorization model and the boundary between on-chain state and physical-world activity.
+  - Recording unresolved risks and future work for team review.
 
-## Checkpoint status
+## 2. Exercises and Practical Work
 
-| Checkpoint | Result |
+### 2.1. Primary Item Workflow Redesign
+
+Reorganized the interface so the main demo journey starts with item lookup and status, followed by the lifecycle panel. Admin / Registry setup and Cell Inspector Diagnostics are collapsed by default.
+
+The wallet area was compacted for desktop use, and the deployment confirmation control is hidden while confirmation is being checked. The existing review, JoyID signing, and Testnet submission safeguards were preserved. Chrome review covered desktop and a narrow viewport of approximately 640 CSS pixels.
+
+The user-requested per-cell expand/collapse control for long Cell Inspector Data hex remains deferred.
+
+### 2.2. Submission-Safety Handling
+
+Added a `submissionSafety` domain module and eight focused tests. The app now:
+
+- Blocks starting a second lifecycle submission unless the state is ready and idle.
+- Compares transaction hashes without case sensitivity.
+- Checks signed transaction inputs before submission and clears a local signature when an input is no longer live.
+- Labels a failure before broadcast as not submitted, and a failure after broadcast begins as uncertain.
+- Separates confirmed, pending, and unavailable RPC confirmation results.
+
+These checks do not authorize a transaction by themselves. JoyID signs locally, CKB Lock Scripts verify signatures, and Registry/State Type Scripts enforce on-chain invariants.
+
+### 2.3. Existing Testnet Lifecycle and Evidence
+
+Week 12 reused the existing Week 11 Testnet lifecycle. No new Testnet transaction was submitted during Week 12.
+
+The reviewed item is `0x9f2e2c5938cb346f0d23e112bdf763ff21293285c98967afd181c261f09948c2`. The current live lookup returned `AVAILABLE`; the Registry ID is `0x3b1f5c7ca40ccb35c054e850185398cb2b07b0b7bbfbf1eed4ee1d6265790b60`, with item count 2.
+
+| Operation | Result | Transaction hash | Confirmed block |
+|---|---|---|---:|
+| Registry Genesis | Registry initialized | [0x5ba65a14e5f393589812f2ed5dfb00db68d12dbc8498d5fcf66c98493809bd6f](https://pudge.explorer.nervos.org/transaction/0x5ba65a14e5f393589812f2ed5dfb00db68d12dbc8498d5fcf66c98493809bd6f) | 22,998,717 |
+| Item registration | AVAILABLE | [0x851d6f428defd2871b0124ea3893249a24a2a30a09970463c4d2953381d71660](https://pudge.explorer.nervos.org/transaction/0x851d6f428defd2871b0124ea3893249a24a2a30a09970463c4d2953381d71660) | 22,999,622 |
+| Borrow | BORROWED | [0xd88b93213ffcacac9ba691dae189f77c5a631380549246df2a8afb9fa4aa51a1](https://pudge.explorer.nervos.org/transaction/0xd88b93213ffcacac9ba691dae189f77c5a631380549246df2a8afb9fa4aa51a1) | 22,999,649 |
+| Confirm Return | RETURNED | [0x3ac18f18c7831e44c369bae00282255adbfaa7f7b05e3bb572d062e0e5be2a1c](https://pudge.explorer.nervos.org/transaction/0x3ac18f18c7831e44c369bae00282255adbfaa7f7b05e3bb572d062e0e5be2a1c) | 22,999,692 |
+| Make Available | AVAILABLE | [0x71574211cc4a674571b330ca9de6a1beb4215971d2e9911369e9e4865137a482](https://pudge.explorer.nervos.org/transaction/0x71574211cc4a674571b330ca9de6a1beb4215971d2e9911369e9e4865137a482) | 22,999,731 |
+
+The Registry Genesis hash and block are recorded in the [Week 11 report](D:/CKB_prj/ckbuilder/ckb_weekly_report_w11.md) and are included here for traceability. Current UI evidence includes [the live AVAILABLE status](D:/CKB_prj/ReuseLoop/evidence/09_cp12_current_available_item.jpg) and [the recent lifecycle history](D:/CKB_prj/ReuseLoop/evidence/10_cp12_current_lifecycle_history.jpg). The read-only demo instructions are in [week12-demo.md](D:/CKB_prj/ReuseLoop/docs/week12-demo.md).
+
+### 2.4. Setup, Architecture, and Report Updates
+
+Updated the root README and app README with local run and verification commands. Added [developer-setup.md](D:/CKB_prj/ReuseLoop/docs/developer-setup.md) with the pinned Registry and State SHA-256 values, current local artifact paths, WSL build/checksum commands, and the requirement to reselect both files after reloading the app.
+
+Extended [architecture.md](D:/CKB_prj/ReuseLoop/docs/architecture.md) to describe the one-administrator/JoyID model, Lock Script and Type Script responsibilities, manual lookup refresh, RPC/indexer dependencies, and current limitations. The demo walkthrough was corrected to require both verified binaries for lookup and lifecycle preview.
+
+## 3. Verification Results
+
+The following verification activities were completed:
+
+| Verification | Result |
 |---|---|
-| CP12.1 — UI redesign | Complete. The lookup/lifecycle journey is primary; Admin/Registry setup and Diagnostics are collapsed by default. Preview, wallet signing, submission, confirmation, and uncertain outcomes remain separate. |
-| CP12.2 — Core and failure-path verification | Complete with scope limits recorded. App tests: 62 passed across 9 files. Contract tests: 77 passed, 0 failed. Production build passed with Vite's existing large-chunk warning. |
-| CP12.3 — Demo and evidence | Complete. The walkthrough reuses confirmed Testnet data, links lifecycle hashes, and includes current UI screenshots. The exact Registry Genesis transaction hash is not claimed because it was not identified in the evidence reviewed. |
-| CP12.4 — Documentation closeout | Complete. Setup, artifact verification/recovery, architecture and authorization, operational limits, future work, and this report are documented. |
-| CP12.5 — Optional Fiber feasibility | Deferred. Revisit only if a concrete settlement use case and a feasible funded Testnet setup are defined. DOB/Spore also remains future work. |
+| Application test suite | 62 passed, 0 failed across 9 files |
+| Targeted submission-safety tests | 8 added and passed |
+| Application production build | Passed (`tsc -b` and Vite) |
+| Contract integration suite | 77 passed, 0 failed (`make test` in WSL) |
+| Live item lookup | Returned AVAILABLE and loaded the committed history after an initial delay |
+| Registry Genesis and item lifecycle | Existing transactions verified in confirmed blocks listed above |
+| Current artifact files | Registry and State files in `%TEMP%` matched the pinned SHA-256 hashes on 17 Nov 2026 |
+| Browser fault injection | Not performed end to end for JoyID rejection, stale inputs, or RPC timeouts |
+| Fresh RISC-V binary rebuild | Not performed during CP12.4; see toolchain issue below |
 
-## Verification record
+The contract suite covers valid lifecycle transitions, invalid transitions, duplicate registration, and valid, missing, or invalid administrator authorization. The eight app tests cover submission gating, hash matching, stale-input preflight, pre-broadcast versus uncertain outcomes, and confirmation polling results.
 
-- `app`: `npm test` passed **62 tests across 9 files**, including 8 targeted submission-safety tests.
-- `app`: `npm run build` passed (`tsc -b` and Vite). Vite reported that a minified JavaScript chunk is larger than 500 kB.
-- `reuse-loop-contracts`: WSL `make test` passed **77 tests, 0 failed**. The Makefile helper printed `Cannot find clang of version 16+!`; the WSL shell had previously reported Clang 18.1.3, and `cargo test` still completed successfully. The helper probes LLVM strip tools, so a fresh RISC-V contract build has not been inferred from this test result.
-- The lifecycle contract suite covers valid full-cycle transitions, invalid transitions, duplicate registration, and valid/missing/invalid administrator authorization.
-- The added app tests cover duplicate-submit gating, transaction-hash matching, stale-input preflight, pre-send versus uncertain post-send failures, confirmed/pending confirmation, and RPC polling failure.
-- Browser review first showed a delayed `Looking up live cells…` query and later loaded the live item and committed history. Browser fault injection for JoyID rejection, consumed inputs, and RPC timeouts was not performed end to end.
+Vite continues to report a minified JavaScript chunk larger than its 500 kB warning threshold. The contract Makefile helper printed `Cannot find clang of version 16+!` although the WSL shell had reported Clang 18.1.3; `cargo test` nevertheless completed successfully. This test result does not prove a fresh RISC-V binary build will work.
 
-## Existing Testnet evidence
+## 4. Key Learnings
 
-The reviewed item is `0x9f2e2c5938cb346f0d23e112bdf763ff21293285c98967afd181c261f09948c2`. Its live status was `AVAILABLE`; the Registry ID was `0x3b1f5c7ca40ccb35c054e850185398cb2b07b0b7bbfbf1eed4ee1d6265790b60`, with item count 2.
+### 4.1. A Signature Is Not a Submission or Confirmation
 
-| Existing event | Block | Transaction |
-|---|---:|---|
-| CP11.3 contract deployment | 23084185 | [0xdc8890aa1b904b3037095825e02982e7dc4a5aae25fbbc06cc348945f6aced9c](https://pudge.explorer.nervos.org/transaction/0xdc8890aa1b904b3037095825e02982e7dc4a5aae25fbbc06cc348945f6aced9c) |
-| Item registered → AVAILABLE | 22999622 | [0x851d6f428defd2871b0124ea3893249a24a2a30a09970463c4d2953381d71660](https://pudge.explorer.nervos.org/transaction/0x851d6f428defd2871b0124ea3893249a24a2a30a09970463c4d2953381d71660) |
-| Borrow → BORROWED | 22999649 | [0xd88b93213ffcacac9ba691dae189f77c5a631380549246df2a8afb9fa4aa51a1](https://pudge.explorer.nervos.org/transaction/0xd88b93213ffcac9ba691dae189f77c5a631380549246df2a8afb9fa4aa51a1) |
-| Confirm return → RETURNED | 22999692 | [0x3ac18f18c7831e44c369bae00282255adbfaa7f7b05e3bb572d062e0e5be2a1c](https://pudge.explorer.nervos.org/transaction/0x3ac18f18c7831e44c369bae00282255adbfaa7f7b05e3bb572d062e0e5be2a1c) |
-| Make available → AVAILABLE | 22999731 | [0x71574211cc4a674571b330ca9de6a1beb4215971d2e9911369e9e4865137a482](https://pudge.explorer.nervos.org/transaction/0x71574211cc4a674571b330ca9de6a1beb4215971d2e9911369e9e4865137a482) |
+A preview, local JoyID signature, network submission, and block confirmation are different transaction stages. An RPC error after broadcast starts must be treated as uncertain until the transaction hash is checked.
 
-The current lookup and history screenshots are [item status](evidence/09_cp12_current_available_item.jpg) and [lifecycle history](evidence/10_cp12_current_lifecycle_history.jpg). Earlier Week 11 screenshots 05–08 are linked from the [demo guide](docs/week12-demo.md). The current evidence identifies the live Registry ID/cell, but not the Registry Genesis transaction hash; no Genesis hash is guessed here.
+### 4.2. Lookup Is a Snapshot
 
-## Authorization model
+The URL `?item=` parameter only pre-fills the ID. The user must click **Look up item** to query current Registry and State cells. After a confirmed lifecycle transaction, the lookup must be run again to refresh status and history. The Testnet indexer can delay the result.
 
-The MVP uses one administrator lock for Registry Genesis, item registration, and all lifecycle transitions. The frontend currently supports a JoyID CKB Testnet signer for this workflow. The CKB Lock Script verifies the administrator signature; Registry/State Type Scripts validate the configured lock hash, cell linkage, and permitted state changes. Frontend owner matching is an additional user-facing check, not the security boundary. There are no borrower/store-specific keys, multi-party authorization, or administrator recovery/rotation workflow.
+### 4.3. Artifact Identity Matters
 
-## Runtime dependencies and limitations
+The frontend accepts the CP11 Registry and State binaries only when their SHA-256 values match the pinned hashes. The current files are in `%TEMP%`, which may be cleared, and the browser forgets the file selection after reload. A new build must match the pinned hashes before use.
 
-- Both Registry and State binary files must be selected and pass their pinned SHA-256 checks for live lookup and lifecycle preview. The current files are in `%TEMP%\reuseloop-cp11-verified-stripped\registry` and `...\state`; both matched their pinned values on 2026-11-17. Browser selection is held in page memory and must be repeated after reload. See [developer setup and artifact recovery](docs/developer-setup.md).
-- A source rebuild is documented in developer setup, but it was not run for CP12.4. The contract Makefile's Clang/LLVM helper warning needs resolution before treating a new build as a verified replacement.
-- Live status and history depend on the public CKB Testnet RPC and indexer. Lookup is manual; `?item=` only fills the ID field. After a transaction is confirmed, click **Look up item** to refresh. The history query returns at most 20 recent State transactions.
-- If submission was sent but block confirmation could not be checked, the outcome is uncertain. Preserve and inspect the transaction hash before considering any retry.
-- The chain records an administrator-authorized transition. It cannot independently prove physical handoff, return, cleaning, inspection, custody, or package condition.
-- The Cell Inspector renders raw Data hex; the requested per-cell expand/collapse control remains deferred.
-- The production build has an existing >500 kB JavaScript chunk warning.
+### 4.4. On-Chain State Is Not Physical Proof
 
-## Future work
+The single administrator's authorized transaction records the application's state change. It does not independently prove the package was handed over, returned, cleaned, inspected, or held by a particular person or store.
 
-1. Add the user-requested per-cell Data expand/collapse control.
-2. Add browser-level tests for JoyID rejection, duplicate clicks, stale inputs, delayed indexer responses, and timeout/uncertain confirmation recovery.
-3. Fix or clarify the contract build helper's Clang/LLVM tool detection; verify rebuilt binaries against the pinned hashes before use.
-4. Consider frontend code splitting to reduce the large Vite chunk.
-5. If the product needs multiple stores or customers to attest actions, design and test a multi-party authorization model. Treat any physical verification system as a separate feature; the chain alone cannot establish physical events.
-6. Keep Fiber and DOB/Spore deferred until the core workflow is complete and a specific use case and verification plan exist.
-7. Capture and independently verify the Registry Genesis transaction reference if it is needed in future evidence.
+## 5. Challenges and Open Questions
 
-## Reproduction links
+### 5.1. Browser-Level Failure Coverage
 
-- [Developer setup](docs/developer-setup.md)
-- [Week 12 demo guide](docs/week12-demo.md)
-- [Architecture](docs/architecture.md)
-- [Week 12 roadmap](C:/Users/ASUS/Documents/ChatGPT/CKBuilder/week-12-roadmap.md) (workspace copy)
+Contract tests and app helper tests passed, but the browser did not simulate a rejected JoyID request, a consumed input, or a delayed/failed RPC response. Peer review should decide which of these flows are release-critical and should receive end-to-end coverage.
+
+### 5.2. Artifact Recovery and Toolchain Reproducibility
+
+The verified binaries are present in the current Temp folder, but that location is temporary and the app does not persist selected files. WSL reports Clang 18.1.3 while the contract Makefile helper still reports a Clang detection warning. The source build path is documented, but rebuilt artifacts were not produced and hash-checked during CP12.4.
+
+### 5.3. RPC/Indexer Delay and Manual Refresh
+
+The live lookup initially remained in a loading state and later returned successfully. Lookup and history are user-triggered and depend on the CKB Testnet RPC/indexer. The transaction screen can preserve an uncertain hash, but the user must inspect it before retrying.
+
+### 5.4. Remaining UX and Performance Work
+
+The Cell Inspector still renders long Data hex without a per-cell expand/collapse control. Vite's large-chunk warning also remains. Neither issue blocked the read-only demo, but both affect usability or load performance.
+
+### 5.5. Not Completed in Week 12
+
+- No browser-level end-to-end fault-injection suite was added.
+- `npm run lint` was not recorded as run.
+- A fresh RISC-V contract build was not verified against the pinned binary hashes.
+- Per-store or borrower authorization, administrator recovery/rotation, and physical-world proof are not implemented.
+- Fiber and DOB/Spore were not explored; they remain deferred optional extensions.
+
+## 6. Plan for Next Week
+
+Week 13 is planned for peer review with the team. The goal is to collect feedback before extending the MVP further.
+
+Planned activities:
+
+1. **Peer Review Preparation and Session**
+   - Share this report, the demo guide, current screenshots, and transaction references.
+   - Ask the team to review transaction safety, the one-administrator model, artifact setup, RPC/indexer behavior, and the UI's long Data display.
+   - Record feedback with priority, owner, and acceptance criteria.
+2. **Triage Review Findings**
+   - Fix blockers and high-priority correctness or security issues first.
+   - Decide whether browser-level transaction failure tests and binary build reproducibility are required before capstone completion.
+3. **Possible 1–2 Week Capstone Extension**
+   - Request an extension only after peer review confirms the needed scope and the program approves it.
+   - If one extra week is available, prioritize review blockers and a reproducible artifact/toolchain path.
+   - If two extra weeks are available, add browser-level failure coverage and then the highest-priority usability/performance improvements, such as per-cell Data collapse and bundle splitting.
+4. **Keep Optional Integrations Gated**
+   - Do not prioritize Fiber or DOB/Spore unless the team identifies a concrete use case and an independently verifiable plan.
+
+------------------------------------------------------------------------
+
+## Week 12 Final Result
+
+Week 12 completed CP12.1 through CP12.4: the main workflow was reorganized, submission-safety handling and tests were added, the existing full Testnet lifecycle was reviewed and documented, and developer/demo instructions and the weekly report were completed. The app suite passed 62 tests, the contract suite passed 77 tests, and the production build succeeded.
+
+The MVP remains a single-administrator Testnet prototype. Browser-level failure injection, a fresh verified RISC-V rebuild, and the per-cell Data control remain outstanding. The Testnet lookup can be delayed, the artifacts are stored in a temporary location, and the production bundle warning remains. Week 13 will begin with a team peer review; depending on its findings, a 1–2 week extension may be requested for prioritized fixes and verification.
 
